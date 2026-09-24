@@ -21,6 +21,8 @@ import re
 from typing import Any, ClassVar, overload
 import uuid
 
+from falcon.errors import UnsupportedError
+
 __all__ = (
     'BaseConverter',
     'DateTimeConverter',
@@ -61,6 +63,36 @@ class BaseConverter(metaclass=abc.ABCMeta):
             object: Converted field value, or ``None`` if the field
             can not be converted.
         """
+
+    def reverse(self, value: Any) -> str:
+        """Convert a field value back to its URI template string form.
+
+        This method is used by the default router to generate a URI for
+        a named route (see :meth:`~falcon.routing.CompiledRouter.url_for`).
+        Custom converters may override this method to opt into URI
+        generation; the base implementation raises
+        :class:`~falcon.UnsupportedError`, since it can not be assumed
+        that ``str(value)`` would produce a value that
+        :meth:`~.BaseConverter.convert` accepts.
+
+        Args:
+            value (object): The field value to convert to a string.
+
+        Returns:
+            str: A string that :meth:`~.BaseConverter.convert` would
+            transform back into an equivalent value.
+
+        Raises:
+            UnsupportedError: The converter does not support reversing
+                values.
+            ValueError: The value can not be represented by this
+                converter.
+        """
+
+        raise UnsupportedError(
+            '{0} does not support reversing values; a URI can not be '
+            'generated for this field.'.format(type(self).__name__)
+        )
 
 
 def _consumes_multiple_segments(converter: object) -> bool:
@@ -111,6 +143,25 @@ class IntConverter(BaseConverter):
             return None
 
         return _validate_min_max_value(self, converted)
+
+    def reverse(self, value: int) -> str:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                'expected an int value for the int converter, '
+                'got {!r}'.format(value)
+            )
+
+        text = str(value)
+        if self._num_digits is not None and len(text) < self._num_digits:
+            text = text.zfill(self._num_digits)
+
+        if self.convert(text) != value:
+            raise ValueError(
+                'value {!r} does not satisfy the constraints of the '
+                'configured int converter'.format(value)
+            )
+
+        return text
 
 
 @overload
@@ -176,6 +227,23 @@ class FloatConverter(BaseConverter):
 
         return _validate_min_max_value(self, converted)
 
+    def reverse(self, value: float) -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                'expected a float value for the float converter, '
+                'got {!r}'.format(value)
+            )
+
+        text = str(value)
+        converted = self.convert(text)
+        if converted is None or converted != value:
+            raise ValueError(
+                'value {!r} does not satisfy the constraints of the '
+                'configured float converter'.format(value)
+            )
+
+        return text
+
 
 class DateTimeConverter(BaseConverter):
     """Converts a field value to a datetime.
@@ -206,6 +274,22 @@ class DateTimeConverter(BaseConverter):
         except ValueError:
             return None
 
+    def reverse(self, value: datetime) -> str:
+        if not isinstance(value, datetime):
+            raise ValueError(
+                'expected a datetime value for the dt converter, '
+                'got {!r}'.format(value)
+            )
+
+        text = value.strftime(self._format_string)
+        if self.convert(text) is None:
+            raise ValueError(
+                'value {!r} can not be formatted with the configured '
+                'dt converter format string'.format(value)
+            )
+
+        return text
+
 
 class UUIDConverter(BaseConverter):
     """Converts a field value to a uuid.UUID.
@@ -222,6 +306,17 @@ class UUIDConverter(BaseConverter):
             return uuid.UUID(value)
         except ValueError:
             return None
+
+    def reverse(self, value: uuid.UUID | str) -> str:
+        if isinstance(value, uuid.UUID):
+            return str(value)
+
+        try:
+            return str(uuid.UUID(str(value)))
+        except ValueError as ex:
+            raise ValueError(
+                'value {!r} can not be represented as a UUID'.format(value)
+            ) from ex
 
 
 class PathConverter(BaseConverter):
@@ -251,6 +346,18 @@ class PathConverter(BaseConverter):
 
     def convert(self, value: Iterable[str]) -> str:
         return '/'.join(value)
+
+    def reverse(self, value: str | Iterable[str]) -> str:
+        if isinstance(value, str):
+            return value
+
+        try:
+            return '/'.join(str(segment) for segment in value)
+        except TypeError as ex:
+            raise ValueError(
+                'expected a str or an iterable of path segments for the '
+                'path converter, got {!r}'.format(value)
+            ) from ex
 
 
 class RegexConverter(BaseConverter):

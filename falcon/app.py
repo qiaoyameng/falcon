@@ -57,6 +57,7 @@ from falcon._typing import WSGIEnvironment
 from falcon.errors import CompatibilityError
 from falcon.errors import HTTPBadRequest
 from falcon.errors import HTTPInternalServerError
+from falcon.errors import UnsupportedError
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.middleware import CORSMiddleware
@@ -717,6 +718,12 @@ class App(Generic[_ReqT, _RespT]):
                 since it will otherwise delay compilation until the first request
                 is routed. See :meth:`.CompiledRouter.add_route` for further details.
 
+            name (str): Optional name for this route, supported by the default
+                :class:`.CompiledRouter`. A named route's relative URI can
+                later be generated via :meth:`~.App.url_for`, without
+                hard-coding the URI template in the application code. Route
+                names must be unique per app.
+
         Note:
             Any additional keyword arguments not defined above are passed
             through to the underlying router's ``add_route()`` method. The
@@ -739,6 +746,63 @@ class App(Generic[_ReqT, _RespT]):
             raise ValueError("uri_template may not contain '//'")
 
         self._router.add_route(uri_template, resource, **kwargs)
+
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Generate a relative URI for a named route.
+
+        Given the `name` that was passed to :meth:`~.App.add_route` when
+        registering the route, along with values for the route's URI
+        template fields, this method returns an application-relative
+        URI path. Only the path is generated; the request's ``Host``
+        header or any forwarding headers are never consulted, and no
+        absolute URL is produced.
+
+        For example::
+
+            app.add_route('/repos/{org}/{repo}', repo_resource, name='repo')
+
+            # Returns: '/repos/falconry/falcon'
+            app.url_for('repo', org='falconry', repo='falcon')
+
+        Field values are percent-encoded as needed, and the built-in
+        ``int``, ``float``, ``uuid``, ``dt``, and ``path`` field
+        converters are rendered according to their constraints (see
+        also :ref:`routing_builtin_converters`).
+
+        Note:
+            URI generation is implemented by the default
+            :class:`~falcon.routing.CompiledRouter`. When a custom
+            router that does not implement ``url_for()`` is in use,
+            this method raises :class:`~falcon.UnsupportedError`.
+
+        Args:
+            name (str): The name of the route.
+
+        Keyword Args:
+            **params: Values for the URI template fields of the route.
+
+        Returns:
+            str: An application-relative URI path, starting with ``/``.
+
+        Raises:
+            KeyError: No route is registered under `name`, or a value
+                for one of the route's template fields was not provided.
+            ValueError: Extra keyword arguments were given, or a value
+                can not be represented by its field's converter.
+            UnsupportedError: The configured router does not support
+                URI generation, or a field's converter does not support
+                reversing values.
+        """
+
+        router_url_for = getattr(self._router, 'url_for', None)
+        if router_url_for is None:
+            raise UnsupportedError(
+                'The configured router does not support url_for(); URI '
+                'generation for named routes is currently implemented '
+                'only by the default CompiledRouter.'
+            )
+
+        return router_url_for(name, **params)
 
     def add_static_route(
         self,

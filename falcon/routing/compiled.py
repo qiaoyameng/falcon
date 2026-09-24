@@ -37,6 +37,7 @@ from falcon.routing.util import set_default_responders
 from falcon.util.misc import is_python_func
 from falcon.util.sync import _should_wrap_non_coroutines
 from falcon.util.sync import wrap_sync_to_async
+from falcon.util.uri import encode_value
 
 if TYPE_CHECKING:
     from falcon import Request
@@ -91,6 +92,7 @@ class CompiledRouter:
         '_converters',
         '_find',
         '_finder_src',
+        '_named_routes',
         '_options',
         '_patterns',
         '_return_values',
@@ -102,6 +104,7 @@ class CompiledRouter:
         self._ast: _CxParent = _CxParent()
         self._converters: list[converters.BaseConverter] = []
         self._finder_src: str = ''
+        self._named_routes: dict[str, str] = {}
 
         self._options = CompiledRouterOptions()
 
@@ -200,11 +203,30 @@ class CompiledRouter:
                     addition of new routes when hundreds of them are added at
                     once. It is advisable to only set this flag to ``True`` when
                     adding the final route.
+            name (str): Optional name for this route. The name can later be
+                used to generate a relative URI for the route via
+                :meth:`~.CompiledRouter.url_for` (or
+                :meth:`falcon.App.url_for`). Route names must be unique
+                per router; attempting to register a duplicate name raises
+                :class:`~.UnacceptableRouteError` and leaves the previously
+                registered routes untouched.
         """
 
         # NOTE(kgriffs): falcon.asgi.App injects this private kwarg; it is
         #   only intended to be used internally.
         asgi: bool = kwargs.get('_asgi', False)
+
+        # The route name is validated up front so that a conflict can
+        #   never leave the router in a half-registered state.
+        name: str | None = kwargs.pop('name', None)
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise TypeError('Route name must be a non-empty string.')
+            if name in self._named_routes:
+                raise UnacceptableRouteError(
+                    'A route named "{0}" is already registered; route names '
+                    'must be unique.'.format(name)
+                )
 
         method_map = self.map_http_methods(resource, **kwargs)
 
@@ -314,6 +336,8 @@ class CompiledRouter:
                 insert(new_node.children, path_index + 1)
 
         insert(self._roots)
+        if name is not None:
+            self._named_routes[name] = uri_template
         # NOTE(caselit): when compile is True run the actual compile step, otherwise
         # reset the _find, so that _compile will be called on the next find use
         if kwargs.get('compile', False):
@@ -356,9 +380,135 @@ class CompiledRouter:
         else:
             return None
 
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Generate a relative URI for a named route.
+
+        The URI is built from the route's URI template by substituting
+        the given keyword arguments for the corresponding template
+        fields. Only an application-relative path is generated; the
+        request's ``Host`` header or any forwarding headers are never
+        consulted, and no absolute URL is produced.
+
+        Field values are percent-encoded as needed. A value for a normal
+        (single-segment) field may not contain a ``/`` character, since
+        it would decode into additional path segments. Fields using the
+        built-in ``int``, ``float``, ``uuid``, ``dt``, and ``path``
+        converters are rendered according to the converter's
+        constraints; the ``path`` converter may span multiple segments.
+        Custom converters can opt into URI generation by implementing
+        :meth:`~falcon.routing.BaseConverter.reverse`.
+
+        Args:
+            name (str): The name given to the route when it was added
+                (see the `name` keyword argument of
+                :meth:`~.CompiledRouter.add_route`).
+
+        Keyword Args:
+            **params: Values for the URI template fields of the route.
+
+        Returns:
+            str: An application-relative URI path, starting with ``/``.
+
+        Raises:
+            KeyError: No route is registered under `name`, or a value
+                for one of the route's template fields was not provided.
+            ValueError: Extra keyword arguments were given, or a value
+                can not be represented by its field's converter.
+            UnsupportedError: A field's converter does not support
+                reversing values.
+        """
+
+        try:
+            uri_template = self._named_routes[name]
+        except KeyError:
+            raise KeyError(
+                'No route is registered with the name "{0}".'.format(name)
+            ) from None
+
+        used_names: set[str] = set()
+        segments: list[str] = []
+        for segment in uri_template.lstrip('/').split('/'):
+            fields = list(_FIELD_PATTERN.finditer(segment))
+            if not fields:
+                segments.append(segment)
+                continue
+
+            if len(fields) == 1 and fields[0].span() == (0, len(segment)):
+                segments.append(self._reverse_field(fields[0], params, used_names))
+            else:
+                segments.append(
+                    self._reverse_complex_segment(segment, fields, params, used_names)
+                )
+
+        extra_names = sorted(params.keys() - used_names)
+        if extra_names:
+            raise ValueError(
+                'Unexpected URI template field(s) for route "{0}": {1}.'.format(
+                    name, ', '.join(extra_names)
+                )
+            )
+
+        return '/' + '/'.join(segments)
+
     # -----------------------------------------------------------------
     # Private
     # -----------------------------------------------------------------
+
+    def _reverse_field(
+        self,
+        field: re.Match[str],
+        params: dict[str, Any],
+        used_names: set[str],
+    ) -> str:
+        """Render a single URI template field to an encoded string."""
+        fname = field.group('fname')
+        if fname not in params:
+            raise KeyError(
+                'Missing a value for the "{0}" URI template field.'.format(fname)
+            )
+        used_names.add(fname)
+
+        cname = field.group('cname')
+        if cname:
+            converter = self._instantiate_converter(
+                self._converter_map[cname], field.group('argstr')
+            )
+            text = converter.reverse(params[fname])
+            if not isinstance(text, str):
+                raise TypeError(
+                    'The reverse() method of converter "{0}" must return a '
+                    'string, got: {1!r}'.format(cname, text)
+                )
+            if converters._consumes_multiple_segments(converter):
+                return '/'.join(encode_value(part) for part in text.split('/'))
+        else:
+            text = str(params[fname])
+
+        if '/' in text:
+            raise ValueError(
+                'The value for the "{0}" URI template field may not contain '
+                '"/", since it would decode into additional path segments: '
+                '{1!r}'.format(fname, params[fname])
+            )
+
+        return encode_value(text)
+
+    def _reverse_complex_segment(
+        self,
+        segment: str,
+        fields: list[re.Match[str]],
+        params: dict[str, Any],
+        used_names: set[str],
+    ) -> str:
+        """Render a segment mixing literal text and template fields."""
+        parts: list[str] = []
+        last_end = 0
+        for field in fields:
+            parts.append(segment[last_end : field.start()])
+            parts.append(self._reverse_field(field, params, used_names))
+            last_end = field.end()
+        parts.append(segment[last_end:])
+        return ''.join(parts)
 
     def _require_coroutine_responders(self, method_map: MethodDict) -> None:
         for method, responder in method_map.items():

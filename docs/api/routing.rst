@@ -237,6 +237,45 @@ segment. For example::
 and a walkthrough of setting up routes within the context of a sample
 application.)
 
+.. _routing_named_routes:
+
+Named Routes
+------------
+
+A route may be given a name when it is registered, via the ``name``
+keyword argument of :meth:`falcon.App.add_route` (or
+:meth:`falcon.asgi.App.add_route`). The relative URI for a named route
+can then be generated with :meth:`falcon.App.url_for` (or
+:meth:`falcon.asgi.App.url_for`), without hard-coding the URI template
+throughout the application code::
+
+    app.add_route('/repos/{org}/{repo}', repo_resource, name='repo')
+
+    # Returns: '/repos/falconry/falcon'
+    app.url_for('repo', org='falconry', repo='falcon')
+
+Only an application-relative path is generated; the request's ``Host``
+header or any forwarding headers are never consulted, and no absolute
+URL is produced. Route names must be unique per app, and names are not
+shared between different app instances.
+
+Values for template fields are percent-encoded as needed. A value for a
+normal (single-segment) field may not contain a ``/`` character, since
+it would decode into additional path segments. Fields using the
+built-in ``int``, ``float``, ``uuid``, ``dt``, and ``path`` converters
+are rendered according to the converter's constraints, and the ``path``
+converter may span multiple segments. Custom converters can opt into
+URI generation by implementing
+:meth:`~falcon.routing.BaseConverter.reverse`; attempting to generate a
+URI for a field whose converter does not support reversing values
+raises :class:`~falcon.UnsupportedError`.
+
+Note:
+    URI generation is currently implemented only by the default
+    :class:`~falcon.routing.CompiledRouter`. When a custom router that
+    does not provide ``url_for()`` is in use,
+    :meth:`falcon.App.url_for` raises :class:`~falcon.UnsupportedError`.
+
 .. _routing_field_converters:
 
 Field Converters
@@ -329,6 +368,12 @@ simply a class that implements the ``BaseConverter`` interface:
 
 .. autoclass:: falcon.routing.BaseConverter
     :members:
+
+A custom converter may also implement
+:meth:`~falcon.routing.BaseConverter.reverse` to support generating
+URIs for :ref:`named routes <routing_named_routes>`. Converters that
+do not implement it can not be used with
+:meth:`falcon.App.url_for`.
 
 .. _routing_custom:
 
