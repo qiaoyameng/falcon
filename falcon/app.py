@@ -717,6 +717,11 @@ class App(Generic[_ReqT, _RespT]):
                 since it will otherwise delay compilation until the first request
                 is routed. See :meth:`.CompiledRouter.add_route` for further details.
 
+            name (str): Optional unique name for this route, supported by the
+                default :class:`.CompiledRouter`. A named route's relative URI
+                can later be built via :meth:`~.App.url_for`. See
+                :meth:`.CompiledRouter.add_route` for further details.
+
         Note:
             Any additional keyword arguments not defined above are passed
             through to the underlying router's ``add_route()`` method. The
@@ -739,6 +744,63 @@ class App(Generic[_ReqT, _RespT]):
             raise ValueError("uri_template may not contain '//'")
 
         self._router.add_route(uri_template, resource, **kwargs)
+
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Build a relative URI for the route registered under ``name``.
+
+        The URI is rendered from the named route's URI template by
+        substituting the given keyword parameters for the template's field
+        expressions, so that application code does not need to hard-code
+        URI paths. Only the application-relative path is produced; the
+        request's ``Host`` header, any proxy headers, and the scheme are
+        not consulted, and no absolute URL is generated.
+
+        Field values are validated against any field converters used by
+        the template, and percent-encoded as needed.
+
+        Note:
+            This method requires support from the configured router. The
+            default :class:`~.CompiledRouter` implements it; when a custom
+            router is in use that does not provide ``url_for()``, a
+            :exc:`NotImplementedError` is raised.
+
+        Args:
+            name (str): The name that the route was registered with
+                (see the ``name`` keyword argument of
+                :meth:`~.App.add_route`). This argument is positional-only
+                so that it can not clash with a template field of the
+                same name.
+
+        Keyword Args:
+            **params: Field values to substitute into the route's URI
+                template. The given names must match the template's field
+                names exactly; neither missing nor extra parameters are
+                allowed.
+
+        Returns:
+            str: The rendered relative URI path, including the leading
+            ``/``.
+
+        Raises:
+            KeyError: No route is registered under ``name``.
+            ValueError: A parameter is missing or unexpected, or a value
+                can not be rendered according to its field converter.
+            NotImplementedError: The configured router does not support
+                building URIs, or a field converter used by the route does
+                not implement :meth:`~.BaseConverter.to_string`.
+
+        .. versionadded:: 4.4
+        """
+
+        router_url_for = getattr(self._router, 'url_for', None)
+        if router_url_for is None:
+            raise NotImplementedError(
+                'The configured router does not support building URIs from '
+                'route names; use the default CompiledRouter or implement '
+                'url_for() on the custom router.'
+            )
+
+        return router_url_for(name, **params)
 
     def add_static_route(
         self,

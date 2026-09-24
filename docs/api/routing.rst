@@ -330,6 +330,81 @@ simply a class that implements the ``BaseConverter`` interface:
 .. autoclass:: falcon.routing.BaseConverter
     :members:
 
+In order to also support building URIs for :ref:`named routes
+<routing_named_routes>`, a custom converter must implement
+:meth:`~.BaseConverter.to_string` to render its values back to strings.
+All of the :ref:`built-in converters <routing_builtin_converters>`
+implement this method, with the exception of
+:class:`~.RegexConverter`.
+
+.. _routing_named_routes:
+
+Named Routes
+------------
+
+Falcon's default router can build a relative URI for a route from its
+name, so that application code does not need to hard-code URI paths.
+To use this feature, register the route with a unique ``name``:
+
+.. tab-set::
+
+    .. tab-item:: WSGI
+
+        .. code:: python
+
+            import falcon
+
+            app = falcon.App()
+            app.add_route('/items/{item_id:int}', items, name='item')
+
+            # Later, elsewhere in the application:
+            path = app.url_for('item', item_id=42)
+            # path == '/items/42'
+
+    .. tab-item:: ASGI
+
+        .. code:: python
+
+            import falcon.asgi
+
+            app = falcon.asgi.App()
+            app.add_route('/items/{item_id:int}', items, name='item')
+
+            # Later, elsewhere in the application:
+            path = app.url_for('item', item_id=42)
+            # path == '/items/42'
+
+:meth:`~falcon.App.url_for` renders the route's URI template by
+substituting the given keyword arguments for the template's field
+expressions. Only the application-relative path is produced; the
+request's ``Host`` header, any proxy headers, and the scheme are never
+consulted, and no absolute URL is generated.
+
+Field values are validated against any field converters used by the
+template, so a value that would not match the route (for example, an
+integer outside the bounds of ``{item_id:int(min=1, max=100)}``) is
+rejected with a :class:`ValueError`. Values are also percent-encoded as
+needed, and a plain field value may not contain a ``/`` character, since
+it would be decoded into additional path segments. Fields using the
+``path`` converter may span multiple segments, and their ``/``
+characters are preserved:
+
+.. code:: python
+
+    app.add_route('/files/{file_path:path}', files, name='file')
+    app.add_route('/hello/{name}', hello, name='hello')
+
+    app.url_for('file', file_path='a/b/c.txt')  # '/files/a/b/c.txt'
+    app.url_for('hello', name='100% café')      # '/hello/100%25%20caf%C3%A9'
+    app.url_for('hello', name='a/b')            # raises ValueError
+
+Route names must be unique per application; registering a different URI
+template under an already-used name raises
+:class:`~.UnacceptableRouteError`. Routes registered without a name are
+unaffected, and custom routers that do not implement ``url_for()``
+raise :class:`NotImplementedError` when
+:meth:`~falcon.App.url_for` is called.
+
 .. _routing_custom:
 
 Custom Routers

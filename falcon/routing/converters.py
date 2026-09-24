@@ -62,6 +62,38 @@ class BaseConverter(metaclass=abc.ABCMeta):
             can not be converted.
         """
 
+    def to_string(self, value: Any) -> str:
+        """Convert a field value back to its URI string representation.
+
+        This method is used by the default router when building a URI for
+        a named route (see :meth:`~.CompiledRouter.url_for`). Converters
+        that do not implement it can not be used for URI building.
+
+        Note:
+            The returned string should be the raw (not yet
+            percent-encoded) representation of the value. The router will
+            validate it by passing it back through
+            :meth:`~.BaseConverter.convert`, and percent-encode it as
+            needed.
+
+        Args:
+            value (object): The converted field value to render as a
+                URI path string.
+
+        Returns:
+            str: The string representation of the value, suitable for
+            inclusion in a URI path.
+
+        Raises:
+            NotImplementedError: The converter does not support
+                reversing values to strings.
+        """
+        raise NotImplementedError(
+            '{0} does not support converting values back to strings; '
+            'implement to_string() to enable URI building for named '
+            'routes.'.format(type(self).__name__)
+        )
+
 
 def _consumes_multiple_segments(converter: object) -> bool:
     return getattr(converter, 'CONSUME_MULTIPLE_SEGMENTS', False)
@@ -111,6 +143,9 @@ class IntConverter(BaseConverter):
             return None
 
         return _validate_min_max_value(self, converted)
+
+    def to_string(self, value: int) -> str:
+        return str(value)
 
 
 @overload
@@ -176,6 +211,9 @@ class FloatConverter(BaseConverter):
 
         return _validate_min_max_value(self, converted)
 
+    def to_string(self, value: float) -> str:
+        return str(value)
+
 
 class DateTimeConverter(BaseConverter):
     """Converts a field value to a datetime.
@@ -206,6 +244,9 @@ class DateTimeConverter(BaseConverter):
         except ValueError:
             return None
 
+    def to_string(self, value: datetime) -> str:
+        return value.strftime(self._format_string)
+
 
 class UUIDConverter(BaseConverter):
     """Converts a field value to a uuid.UUID.
@@ -222,6 +263,9 @@ class UUIDConverter(BaseConverter):
             return uuid.UUID(value)
         except ValueError:
             return None
+
+    def to_string(self, value: uuid.UUID) -> str:
+        return str(value)
 
 
 class PathConverter(BaseConverter):
@@ -251,6 +295,13 @@ class PathConverter(BaseConverter):
 
     def convert(self, value: Iterable[str]) -> str:
         return '/'.join(value)
+
+    def to_string(self, value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError(
+                'PathConverter values must be strings, got: {0!r}'.format(value)
+            )
+        return value
 
 
 class RegexConverter(BaseConverter):
