@@ -41,10 +41,11 @@ class BaseConverter(metaclass=abc.ABCMeta):
 
     CONSUME_MULTIPLE_SEGMENTS: ClassVar[bool] = False
     """When set to ``True`` it indicates that this converter will consume
-    multiple URL path segments. Currently a converter with
-    ``CONSUME_MULTIPLE_SEGMENTS=True`` must be at the end of the URL template
-    effectively meaning that it will consume all of the remaining URL path
-    segments.
+    multiple URL path segments. A converter with
+    ``CONSUME_MULTIPLE_SEGMENTS=True`` may appear at most once per route
+    template, and it always consumes as many of the remaining URL path
+    segments as possible: any template segments that follow it are matched
+    against the end of the remaining path.
     """
 
     @abc.abstractmethod
@@ -229,11 +230,20 @@ class PathConverter(BaseConverter):
 
     Identifier: ``path``
 
-    This field converter matches the remainder of the URL path,
-    returning it as a string.
+    This field converter matches one or more consecutive URL path
+    segments, returning them joined as a string.
 
-    This converter is currently supported only when used at the
-    end of the URL template.
+    When used at the end of the URL template, this converter simply
+    matches the remainder of the URL path. It may also be followed by
+    other template segments; in that case the trailing segments are
+    matched against the end of the remaining path, and the converter
+    consumes as many segments as possible. For example, considering the
+    template ``'/archives/{key:path}/revisions/{revision:int}'``, the
+    path ``'/archives/a/revisions/1/revisions/2'`` will match with
+    ``key='a/revisions/1'`` and ``revision=2``.
+
+    Only one field per route template may use a converter that consumes
+    multiple path segments.
 
     The classic routing rules of falcon apply also to this converter:
     considering the template ``'/foo/bar/{matched_path:path}'``, the path
@@ -245,6 +255,11 @@ class PathConverter(BaseConverter):
     (See also: :ref:`trailing_slash_in_path`)
 
     .. versionadded:: 4.0
+
+    .. versionchanged:: 4.4
+        This converter is no longer required to be placed at the end of
+        the URL template; any template segments that follow it are matched
+        against the end of the remaining path.
     """
 
     CONSUME_MULTIPLE_SEGMENTS = True

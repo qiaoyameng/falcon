@@ -847,23 +847,47 @@ def test_params_in_non_taken_branches(param_router, route, expected, num):
 # capture path
 
 
-def test_capture_path_no_children():
+def test_capture_path_with_children():
     router = DefaultRouter()
     router.add_route('/foo/{bar:path}', ResourceWithId(1))
     res = router.finder_src
+    router.add_route('/foo/{bar:path}/child', ResourceWithId(2))
+    assert res != router.finder_src
+
+    resource, __, params, __ = router.find('/foo/some/path')
+    assert resource.resource_id == 1
+    assert params == {'bar': 'some/path'}
+
+    resource, __, params, __ = router.find('/foo/some/path/child')
+    assert resource.resource_id == 2
+    assert params == {'bar': 'some/path'}
+
+
+@pytest.mark.parametrize(
+    'template',
+    (
+        '/foo/{a:path}/{b:path}',
+        '/foo/{a:path}/bar/{b:path}',
+        '/{a:path}/{b:path}',
+        '/foo/{a:path}/bar/{b:path}/baz',
+    ),
+)
+def test_capture_path_multiple_multi_segment(template):
+    router = DefaultRouter()
+    router.add_route('/foo/{a:path}/bar', ResourceWithId(1))
+    res = router.finder_src
     with pytest.raises(
         ValueError,
-        match='Cannot add route with template "/foo/{bar:path}/child". '
-        'Field name "bar" uses the converter "path"',
+        match='only one field per route template may consume multiple path '
+        'segments',
     ):
-        router.add_route('/foo/{bar:path}/child', ResourceWithId(1))
-    with pytest.raises(
-        ValueError,
-        match='Cannot add route with template "/{bar:path}/child". '
-        'Field name "bar" uses the converter "path"',
-    ):
-        router.add_route('/{bar:path}/child', ResourceWithId(1))
+        router.add_route(template, ResourceWithId(2))
+    # NOTE: The rejected template must not pollute the compiled router.
     assert res == router.finder_src
+
+    resource, __, params, __ = router.find('/foo/some/path/bar')
+    assert resource.resource_id == 1
+    assert params == {'a': 'some/path'}
 
 
 @pytest.mark.parametrize(

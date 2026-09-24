@@ -243,18 +243,11 @@ class CompiledRouter:
         for segment in path:
             self._validate_template_segment(segment, used_names)
 
-        def find_cmp_converter(node: CompiledRouterNode) -> tuple[str, str] | None:
-            value = [
-                (field, converter)
-                for field, converter, _ in node.var_converter_map
-                if converters._consumes_multiple_segments(
-                    self._converter_map[converter]
-                )
-            ]
-            if value:
-                return value[0]
-            else:
-                return None
+        # NOTE: Validate the use of converters that consume multiple path
+        #   segments (such as "path") before touching the routing tree, so
+        #   that rejecting a template never leaves the (possibly already
+        #   compiled) router in a modified state.
+        self._validate_multi_segment_fields(uri_template, path)
 
         def insert(nodes: list[CompiledRouterNode], path_index: int = 0) -> None:
             for node in nodes:
@@ -267,11 +260,6 @@ class CompiledRouter:
                         node.resource = resource
                         node.uri_template = uri_template
                     else:
-                        cpc = find_cmp_converter(node)
-                        if cpc:
-                            raise UnacceptableRouteError(
-                                _NO_CHILDREN_ERR.format(uri_template, *cpc)
-                            )
                         insert(node.children, path_index)
 
                     return
@@ -290,27 +278,12 @@ class CompiledRouter:
             # exist and needs to be created. This builds a new branch of the
             # routing tree recursively until it reaches the new node leaf.
             new_node = CompiledRouterNode(path[path_index])
-            if new_node.is_complex:
-                cpc = find_cmp_converter(new_node)
-                if cpc:
-                    raise UnacceptableRouteError(
-                        'Cannot use converter "{1}" of variable "{0}" in a template '
-                        'that includes other characters or variables.'.format(*cpc)
-                    )
             nodes.append(new_node)
             if path_index == len(path) - 1:
                 new_node.method_map = method_map
                 new_node.resource = resource
                 new_node.uri_template = uri_template
             else:
-                cpc = find_cmp_converter(new_node)
-                if cpc:
-                    # NOTE(caselit): assume success and remove the node if it's not
-                    # supported to avoid leaving the router in a broken state.
-                    nodes.remove(new_node)
-                    raise UnacceptableRouteError(
-                        _NO_CHILDREN_ERR.format(uri_template, *cpc)
-                    )
                 insert(new_node.children, path_index + 1)
 
         insert(self._roots)
@@ -447,6 +420,54 @@ class CompiledRouter:
                     msg = 'Cannot instantiate converter "{}"'.format(name)
                     raise UnacceptableRouteError(msg) from e
 
+    def _validate_multi_segment_fields(
+        self, uri_template: str, path: list[str]
+    ) -> None:
+        """Validate the use of converters that consume multiple path segments.
+
+        At most one field per route template may use such a converter, and
+        the field must span its entire path segment. This also guarantees
+        that multi-segment fields can never be nested below one another in
+        the routing tree, since descending below such a node requires
+        repeating its field expression in the template. This method
+        performs read-only checks so that rejecting a template leaves the
+        routing tree untouched.
+        """
+
+        multi_segment_fields = []
+        for segment in path:
+            fields = list(_FIELD_PATTERN.finditer(segment))
+            for field in fields:
+                cname = field.group('cname')
+                if cname and converters._consumes_multiple_segments(
+                    self._converter_map[cname]
+                ):
+                    multi_segment_fields.append((segment, field))
+
+        if not multi_segment_fields:
+            return
+
+        if len(multi_segment_fields) > 1:
+            __, first = multi_segment_fields[0]
+            __, second = multi_segment_fields[1]
+            raise UnacceptableRouteError(
+                _MULTIPLE_CMP_CONVERTERS_ERR.format(
+                    uri_template,
+                    second.group('fname'),
+                    second.group('cname'),
+                    first.group('fname'),
+                )
+            )
+
+        segment, field = multi_segment_fields[0]
+        if field.span() != (0, len(segment)):
+            raise UnacceptableRouteError(
+                'Cannot use converter "{1}" of variable "{0}" in a template '
+                'that includes other characters or variables.'.format(
+                    field.group('fname'), field.group('cname')
+                )
+            )
+
     def _generate_ast(  # noqa: C901
         self,
         nodes: list[CompiledRouterNode],
@@ -496,6 +517,30 @@ class CompiledRouter:
         for node in nodes:
             params_stack = original_params_stack.copy()
             consume_multiple_segments = False
+            if (
+                node.is_var
+                and not node.is_complex
+                and node.children
+                and node.var_converter_map
+                and converters._consumes_multiple_segments(
+                    self._converter_map[node.var_converter_map[0][1]]
+                )
+            ):
+                # NOTE: A converter that consumes multiple path segments
+                #   followed by a suffix subtree. The suffix is matched
+                #   against the end of the remaining path, so this branch
+                #   is generated separately from the common one below.
+                found_simple = True
+                self._generate_multi_segment_ast(
+                    node,
+                    parent,
+                    return_values,
+                    patterns,
+                    params_stack,
+                    level,
+                )
+                continue
+
             if node.is_var:
                 if node.is_complex:
                     # NOTE(richardolsson): Complex nodes are nodes which
@@ -626,6 +671,176 @@ class CompiledRouter:
         if not found_simple and fast_return:
             parent.append_child(_CxReturnNone())
 
+    def _generate_multi_segment_ast(
+        self,
+        node: CompiledRouterNode,
+        parent: _CxParent,
+        return_values: list[CompiledRouterNode],
+        patterns: list[Pattern[Any]],
+        params_stack: list[_CxElement],
+        level: int,
+    ) -> None:
+        """Generate the AST for a multi-segment converter with a suffix subtree.
+
+        The suffix below the converter is matched against the end of the
+        remaining path, so the converter always consumes as many segments
+        as possible (a greedy, end-anchored split). Every candidate route
+        is tried with its unique end-anchored split, so no backtracking
+        over split points ever takes place, and failed candidates never
+        leak parameters into the ``params`` dict of other routes.
+        """
+
+        __, converter_name, converter_argstr = node.var_converter_map[0]
+        converter_class = self._converter_map[converter_name]
+        converter_obj = self._instantiate_converter(converter_class, converter_argstr)
+        converter_idx = len(self._converters)
+        self._converters.append(converter_obj)
+
+        field_name = node.var_name
+        assert field_name is not None
+
+        # NOTE: More specific (deeper) suffixes are tried first.
+        for chain in self._suffix_chains(node):
+            depth = len(chain)
+            cx_chain = _CxIfPathLength('>', level + depth)
+            parent.append_child(cx_chain)
+
+            leaf_params = params_stack.copy()
+            cx_leaf = self._generate_suffix_chain_ast(
+                chain, depth, cx_chain, leaf_params, patterns
+            )
+
+            cx_leaf.append_child(_CxSetFragmentFromPathRange(level, depth))
+            cx_converter = _CxIfConverterField(len(leaf_params) + 1, converter_idx)
+            leaf_params.append(
+                _CxSetParamFromValue(field_name, cx_converter.field_variable_name)
+            )
+            cx_leaf.append_child(cx_converter)
+            cx_leaf = cx_converter
+
+            resource_idx = len(return_values)
+            return_values.append(chain[-1])
+            for params in leaf_params:
+                cx_leaf.append_child(params)
+            cx_leaf.append_child(_CxReturnValue(resource_idx))
+
+        if node.resource is not None:
+            # NOTE: The converter node is itself a route; preserve the
+            #   historical trailing behavior as a fallback after the more
+            #   specific suffix candidates.
+            resource_idx = len(return_values)
+            return_values.append(node)
+
+            parent.append_child(_CxSetFragmentFromRemainingPaths(level))
+            cx_converter = _CxIfConverterField(len(params_stack) + 1, converter_idx)
+            leaf_params = params_stack + [
+                _CxSetParamFromValue(field_name, cx_converter.field_variable_name)
+            ]
+            for params in leaf_params:
+                cx_converter.append_child(params)
+            cx_converter.append_child(_CxReturnValue(resource_idx))
+            parent.append_child(cx_converter)
+
+    def _suffix_chains(
+        self, node: CompiledRouterNode
+    ) -> list[list[CompiledRouterNode]]:
+        """Collect the node chains from *node* to each resource-bearing descendant."""
+        chains: list[list[CompiledRouterNode]] = []
+
+        def walk(current: CompiledRouterNode, chain: list[CompiledRouterNode]) -> None:
+            children = sorted(
+                current.children,
+                key=lambda child: (
+                    child.is_var + (child.is_var and not child.is_complex)
+                ),
+            )
+            for child in children:
+                child_chain = chain + [child]
+                if child.resource is not None:
+                    chains.append(child_chain)
+                if child.children:
+                    walk(child, child_chain)
+
+        walk(node, [])
+
+        # NOTE: Deeper (more specific) suffixes are tried first; the sort
+        #   is stable, so registration order does not affect the outcome.
+        chains.sort(key=lambda chain: -len(chain))
+        return chains
+
+    def _generate_suffix_chain_ast(
+        self,
+        chain: list[CompiledRouterNode],
+        depth: int,
+        parent: _CxParent,
+        params_stack: list[_CxElement],
+        patterns: list[Pattern[Any]],
+    ) -> _CxParent:
+        """Generate the AST matching a suffix chain against the end of the path."""
+        cx_parent = parent
+        for index, node in enumerate(chain):
+            # NOTE: The segment is addressed relative to the end of the
+            #   path, anchoring the suffix to it.
+            segment_expr = 'path_len - {0}'.format(depth - index)
+            if not node.is_var:
+                cx_segment = _CxIfPathSegmentLiteral(segment_expr, node.raw_segment)
+                cx_parent.append_child(cx_segment)
+                cx_parent = cx_segment
+            elif node.is_complex:
+                assert node.var_pattern
+                pattern_idx = len(patterns)
+                patterns.append(node.var_pattern)
+
+                cx_segment = _CxIfPathSegmentPattern(
+                    segment_expr, pattern_idx, node.var_pattern.pattern
+                )
+                cx_parent.append_child(cx_segment)
+                cx_parent = cx_segment
+
+                if node.var_converter_map:
+                    cx_parent.append_child(_CxPrefetchGroupsFromPatternMatch())
+                    cx_parent = self._generate_conversion_ast(
+                        cx_parent, node, params_stack
+                    )
+                else:
+                    cx_pattern = _CxVariableFromPatternMatch(len(params_stack) + 1)
+                    params_stack.append(
+                        _CxSetParamsFromDict(cx_pattern.dict_variable_name)
+                    )
+                    cx_parent.append_child(cx_pattern)
+            else:
+                field_name = node.var_name
+                assert field_name is not None
+                if node.var_converter_map:
+                    assert len(node.var_converter_map) == 1
+
+                    __, converter_name, converter_argstr = node.var_converter_map[0]
+                    converter_class = self._converter_map[converter_name]
+
+                    converter_obj = self._instantiate_converter(
+                        converter_class, converter_argstr
+                    )
+                    converter_idx = len(self._converters)
+                    self._converters.append(converter_obj)
+
+                    cx_parent.append_child(_CxSetFragmentFromPath(segment_expr))
+                    cx_converter = _CxIfConverterField(
+                        len(params_stack) + 1, converter_idx
+                    )
+                    params_stack.append(
+                        _CxSetParamFromValue(
+                            field_name, cx_converter.field_variable_name
+                        )
+                    )
+                    cx_parent.append_child(cx_converter)
+                    cx_parent = cx_converter
+                else:
+                    params_stack.append(
+                        _CxSetParamFromPath(field_name, segment_expr)
+                    )
+
+        return cx_parent
+
     def _generate_conversion_ast(
         self,
         parent: _CxParent,
@@ -738,10 +953,11 @@ class CompiledRouter:
         )
 
 
-_NO_CHILDREN_ERR = (
-    'Cannot add route with template "{0}". Field name "{1}" '
-    'uses the converter "{2}" that will consume all the path, '
-    'making it impossible to match this route.'
+_MULTIPLE_CMP_CONVERTERS_ERR = (
+    'Cannot add route with template "{0}". Field name "{1}" uses the '
+    'converter "{2}" that consumes multiple path segments, but field '
+    'name "{3}" already does so; only one field per route template may '
+    'consume multiple path segments.'
 )
 
 
@@ -1081,7 +1297,7 @@ class _CxIfPathLength(_CxParent):
 
 
 class _CxIfPathSegmentLiteral(_CxParent):
-    def __init__(self, segment_idx: int, literal: str) -> None:
+    def __init__(self, segment_idx: int | str, literal: str) -> None:
         super().__init__()
         self._segment_idx = segment_idx
         self._literal = literal
@@ -1097,7 +1313,9 @@ class _CxIfPathSegmentLiteral(_CxParent):
 
 
 class _CxIfPathSegmentPattern(_CxParent):
-    def __init__(self, segment_idx: int, pattern_idx: int, pattern_text: str) -> None:
+    def __init__(
+        self, segment_idx: int | str, pattern_idx: int, pattern_text: str
+    ) -> None:
         super().__init__()
         self._segment_idx = segment_idx
         self._pattern_idx = pattern_idx
@@ -1153,13 +1371,26 @@ class _CxSetFragmentFromField(_CxChild):
 
 
 class _CxSetFragmentFromPath(_CxChild):
-    def __init__(self, segment_idx: int) -> None:
+    def __init__(self, segment_idx: int | str) -> None:
         self._segment_idx = segment_idx
 
     def src(self, indentation: int) -> str:
         return '{0}fragment = path[{1}]'.format(
             _TAB_STR * indentation,
             self._segment_idx,
+        )
+
+
+class _CxSetFragmentFromPathRange(_CxChild):
+    def __init__(self, start_idx: int, end_offset: int) -> None:
+        self._start_idx = start_idx
+        self._end_offset = end_offset
+
+    def src(self, indentation: int) -> str:
+        return '{0}fragment = path[{1}:path_len - {2}]'.format(
+            _TAB_STR * indentation,
+            self._start_idx,
+            self._end_offset,
         )
 
 
@@ -1215,7 +1446,7 @@ class _CxReturnValue(_CxChild):
 
 
 class _CxSetParamFromPath(_CxChild):
-    def __init__(self, param_name: str, segment_idx: int) -> None:
+    def __init__(self, param_name: str, segment_idx: int | str) -> None:
         self._param_name = param_name
         self._segment_idx = segment_idx
 
