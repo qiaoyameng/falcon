@@ -57,6 +57,40 @@ _FIELD_PATTERN = re.compile(
 _IDENTIFIER_PATTERN = re.compile('[A-Za-z_][A-Za-z0-9_]*$')
 
 
+def _segment_idx_src(segment_idx: int, offset: str | None) -> str:
+    """Render a path index expression, optionally relative to `offset`."""
+    if offset is None:
+        return str(segment_idx)
+    if segment_idx == 0:
+        return offset
+    return '{0} + {1}'.format(offset, segment_idx)
+
+
+def _suffix_depth_bounds(node: 'CompiledRouterNode') -> tuple[int, int]:
+    """Compute the (min, max) number of segments from `node` to a resource.
+
+    Every node in the routing tree belongs to at least one route, so a
+    resource is always reachable; the bounds are used to limit the number
+    of splits to try for a converter that consumes multiple segments in
+    the middle of a template.
+    """
+    min_depth: int | None = None
+    max_depth: int | None = None
+
+    if node.resource is not None:
+        min_depth = max_depth = 0
+
+    for child in node.children:
+        child_min, child_max = _suffix_depth_bounds(child)
+        child_min += 1
+        child_max += 1
+        min_depth = child_min if min_depth is None else min(min_depth, child_min)
+        max_depth = child_max if max_depth is None else max(max_depth, child_max)
+
+    assert min_depth is not None and max_depth is not None
+    return min_depth, max_depth
+
+
 class CompiledRouter:
     """Fast URI router which compiles its routing logic to Python code.
 
@@ -243,6 +277,30 @@ class CompiledRouter:
         for segment in path:
             self._validate_template_segment(segment, used_names)
 
+        # NOTE(caselit): At most one field per template may use a converter
+        # that consumes multiple segments. This is validated up front, before
+        # the routing tree is modified, so that a rejected template can not
+        # leave the router in a broken state.
+        multi_segment_field = None
+        for segment in path:
+            for field in _FIELD_PATTERN.finditer(segment):
+                converter_name = field.group('cname')
+                if converter_name and converters._consumes_multiple_segments(
+                    self._converter_map[converter_name]
+                ):
+                    if multi_segment_field is not None:
+                        raise UnacceptableRouteError(
+                            'Cannot add route with template "{0}". Only one '
+                            'field per template may use a converter that '
+                            'consumes multiple path segments, but both '
+                            '"{1}" and "{2}" do.'.format(
+                                uri_template,
+                                multi_segment_field,
+                                field.group('fname'),
+                            )
+                        )
+                    multi_segment_field = field.group('fname')
+
         def find_cmp_converter(node: CompiledRouterNode) -> tuple[str, str] | None:
             value = [
                 (field, converter)
@@ -267,11 +325,6 @@ class CompiledRouter:
                         node.resource = resource
                         node.uri_template = uri_template
                     else:
-                        cpc = find_cmp_converter(node)
-                        if cpc:
-                            raise UnacceptableRouteError(
-                                _NO_CHILDREN_ERR.format(uri_template, *cpc)
-                            )
                         insert(node.children, path_index)
 
                     return
@@ -303,14 +356,6 @@ class CompiledRouter:
                 new_node.resource = resource
                 new_node.uri_template = uri_template
             else:
-                cpc = find_cmp_converter(new_node)
-                if cpc:
-                    # NOTE(caselit): assume success and remove the node if it's not
-                    # supported to avoid leaving the router in a broken state.
-                    nodes.remove(new_node)
-                    raise UnacceptableRouteError(
-                        _NO_CHILDREN_ERR.format(uri_template, *cpc)
-                    )
                 insert(new_node.children, path_index + 1)
 
         insert(self._roots)
@@ -456,8 +501,17 @@ class CompiledRouter:
         params_stack: list[_CxElement],
         level: int = 0,
         fast_return: bool = True,
+        offset: str | None = None,
     ) -> None:
-        """Generate a coarse AST for the router."""
+        """Generate a coarse AST for the router.
+
+        When `offset` is given, it is the name of a variable holding the
+        index of the first segment to match, so that the generated code
+        addresses the path as ``path[offset + level]`` instead of
+        ``path[level]``. This is used to match the segments following a
+        converter that consumes multiple segments in the middle of a
+        template, where the split point is only known at runtime.
+        """
         # NOTE(caselit): setting of the parameters in the params dict is delayed until
         # a match has been found by adding them to the param_stack. This way superfluous
         # parameters are not set to the params dict while descending on branches that
@@ -467,7 +521,7 @@ class CompiledRouter:
         if not nodes:
             return
 
-        outer_parent = _CxIfPathLength('>', level)
+        outer_parent = _CxIfPathLength('>', level, offset)
         parent.append_child(outer_parent)
         parent = outer_parent
 
@@ -507,7 +561,7 @@ class CompiledRouter:
                     patterns.append(node.var_pattern)
 
                     cx_segment = _CxIfPathSegmentPattern(
-                        level, pattern_idx, node.var_pattern.pattern
+                        level, pattern_idx, node.var_pattern.pattern, offset
                     )
                     parent.append_child(cx_segment)
                     parent = cx_segment
@@ -544,23 +598,57 @@ class CompiledRouter:
                         self._converters.append(converter_obj)
                         if converters._consumes_multiple_segments(converter_obj):
                             consume_multiple_segments = True
-                            parent.append_child(_CxSetFragmentFromRemainingPaths(level))
+                            if node.children:
+                                # NOTE: The converter is followed by more
+                                # segments in the template, so generate a
+                                # loop that tries every feasible split of
+                                # the remaining path, starting with the one
+                                # that consumes the most segments.
+                                self._generate_split_loop_ast(
+                                    node,
+                                    parent,
+                                    return_values,
+                                    patterns,
+                                    params_stack,
+                                    level,
+                                    field_name,
+                                    converter_idx,
+                                    offset,
+                                )
+                            else:
+                                parent.append_child(
+                                    _CxSetFragmentFromRemainingPaths(level, offset)
+                                )
+
+                                cx_converter = _CxIfConverterField(
+                                    len(params_stack) + 1, converter_idx
+                                )
+                                params_stack.append(
+                                    _CxSetParamFromValue(
+                                        field_name, cx_converter.field_variable_name
+                                    )
+                                )
+
+                                parent.append_child(cx_converter)
+                                parent = cx_converter
                         else:
-                            parent.append_child(_CxSetFragmentFromPath(level))
+                            parent.append_child(_CxSetFragmentFromPath(level, offset))
 
-                        cx_converter = _CxIfConverterField(
-                            len(params_stack) + 1, converter_idx
-                        )
-                        params_stack.append(
-                            _CxSetParamFromValue(
-                                field_name, cx_converter.field_variable_name
+                            cx_converter = _CxIfConverterField(
+                                len(params_stack) + 1, converter_idx
                             )
-                        )
+                            params_stack.append(
+                                _CxSetParamFromValue(
+                                    field_name, cx_converter.field_variable_name
+                                )
+                            )
 
-                        parent.append_child(cx_converter)
-                        parent = cx_converter
+                            parent.append_child(cx_converter)
+                            parent = cx_converter
                     else:
-                        params_stack.append(_CxSetParamFromPath(field_name, level))
+                        params_stack.append(
+                            _CxSetParamFromPath(field_name, level, offset)
+                        )
 
                     # NOTE(kgriffs): We don't allow multiple simple var nodes
                     # to exist at the same level, e.g.:
@@ -578,7 +666,7 @@ class CompiledRouter:
 
             else:
                 # NOTE(kgriffs): Not a param, so must match exactly
-                cx_literal = _CxIfPathSegmentLiteral(level, node.raw_segment)
+                cx_literal = _CxIfPathSegmentLiteral(level, node.raw_segment, offset)
                 parent.append_child(cx_literal)
                 parent = cx_literal
 
@@ -588,31 +676,56 @@ class CompiledRouter:
                 resource_idx = len(return_values)
                 return_values.append(node)
 
-            assert not (consume_multiple_segments and node.children)
-
-            self._generate_ast(
-                node.children,
-                parent,
-                return_values,
-                patterns,
-                params_stack.copy(),
-                level + 1,
-                fast_return,
-            )
+            if not (consume_multiple_segments and node.children):
+                # NOTE: When the converter consumes multiple segments and is
+                # followed by more segments in the template, the matcher for
+                # the nodes below has already been generated inside the split
+                # loop above.
+                self._generate_ast(
+                    node.children,
+                    parent,
+                    return_values,
+                    patterns,
+                    params_stack.copy(),
+                    level + 1,
+                    fast_return,
+                    offset,
+                )
 
             if node.resource is None:
                 if fast_return:
                     parent.append_child(_CxReturnNone())
             else:
                 if consume_multiple_segments:
-                    for params in params_stack:
-                        parent.append_child(params)
-                    parent.append_child(_CxReturnValue(resource_idx))
+                    if node.children:
+                        # NOTE: When no split in the loop above matched the
+                        # remainder of the template, fall back to consuming
+                        # the rest of the path, preserving the behavior of a
+                        # multi-segment converter at the end of the template.
+                        parent.append_child(
+                            _CxSetFragmentFromRemainingPaths(level, offset)
+                        )
+                        cx_fallback = _CxIfConverterField(
+                            len(params_stack) + 1, converter_idx
+                        )
+                        parent.append_child(cx_fallback)
+                        fallback_params_stack = params_stack + [
+                            _CxSetParamFromValue(
+                                field_name, cx_fallback.field_variable_name
+                            )
+                        ]
+                        for params in fallback_params_stack:
+                            cx_fallback.append_child(params)
+                        cx_fallback.append_child(_CxReturnValue(resource_idx))
+                    else:
+                        for params in params_stack:
+                            parent.append_child(params)
+                        parent.append_child(_CxReturnValue(resource_idx))
                 else:
                     # NOTE(kgriffs): Make sure that we have consumed all of
                     # the segments for the requested route; otherwise we could
                     # mistakenly match "/foo/23/bar" against "/foo/{id}".
-                    cx_path_len = _CxIfPathLength('==', level + 1)
+                    cx_path_len = _CxIfPathLength('==', level + 1, offset)
                     for params in params_stack:
                         cx_path_len.append_child(params)
                     cx_path_len.append_child(_CxReturnValue(resource_idx))
@@ -666,6 +779,66 @@ class CompiledRouter:
             parent.append_child(cx_pattern_match)
 
         return parent
+
+    def _generate_split_loop_ast(
+        self,
+        node: CompiledRouterNode,
+        parent: _CxParent,
+        return_values: list[CompiledRouterNode],
+        patterns: list[Pattern[Any]],
+        params_stack: list[_CxElement],
+        level: int,
+        field_name: str,
+        converter_idx: int,
+        offset: str | None,
+    ) -> None:
+        """Generate a loop over the feasible splits for a multi-segment field.
+
+        The converter field is followed by more segments in the template, so
+        every split of the remaining path that leaves room for the rest of
+        the template is tried, starting with the one that consumes the most
+        segments. The number of iterations is bounded by a constant derived
+        from the templates (the difference between the longest and the
+        shortest remaining suffix), and therefore does not depend on the
+        length of the requested path.
+        """
+        # NOTE: Only the nodes below are considered; the resource that may
+        # be attached to this node is matched by the fallback that consumes
+        # the rest of the path, generated after the loop.
+        min_suffix = min(_suffix_depth_bounds(child)[0] for child in node.children) + 1
+        max_suffix = max(_suffix_depth_bounds(child)[1] for child in node.children) + 1
+
+        # NOTE: The converter index is unique per node, so it can be used to
+        # build a loop variable name that does not collide with the ones of
+        # other multi-segment fields.
+        loop_variable = 'path_split_{0}'.format(converter_idx)
+        cx_loop = _CxForPathSplit(
+            loop_variable, level, min_suffix, max_suffix, offset
+        )
+        parent.append_child(cx_loop)
+
+        cx_loop.append_child(_CxSetFragmentFromRange(level, loop_variable, offset))
+
+        cx_converter = _CxIfConverterField(len(params_stack) + 1, converter_idx)
+        cx_loop.append_child(cx_converter)
+
+        child_params_stack = params_stack + [
+            _CxSetParamFromValue(field_name, cx_converter.field_variable_name)
+        ]
+
+        # NOTE: A failed attempt must fall through and let the loop try a
+        # shorter split, so the fast "return None" optimization is disabled
+        # while generating the matcher for the remaining segments.
+        self._generate_ast(
+            node.children,
+            cx_converter,
+            return_values,
+            patterns,
+            child_params_stack,
+            0,
+            False,
+            loop_variable,
+        )
 
     def _compile(self) -> Callable[..., Any]:
         """Generate Python code for the entire routing tree.
@@ -736,13 +909,6 @@ class CompiledRouter:
         return self._find(
             path, self._return_values, self._patterns, self._converters, params
         )
-
-
-_NO_CHILDREN_ERR = (
-    'Cannot add route with template "{0}". Field name "{1}" '
-    'uses the converter "{2}" that will consume all the path, '
-    'making it impossible to match this route.'
-)
 
 
 class UnacceptableRouteError(ValueError):
@@ -1065,50 +1231,63 @@ class _CxChild:
 
 
 class _CxIfPathLength(_CxParent):
-    def __init__(self, comparison: str, length: int) -> None:
+    def __init__(
+        self, comparison: str, length: int, offset: str | None = None
+    ) -> None:
         super().__init__()
         self._comparison = comparison
         self._length = length
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         template = '{0}if path_len {1} {2}:\n{3}'
         return template.format(
             _TAB_STR * indentation,
             self._comparison,
-            self._length,
+            _segment_idx_src(self._length, self._offset),
             self._children_src(indentation + 1),
         )
 
 
 class _CxIfPathSegmentLiteral(_CxParent):
-    def __init__(self, segment_idx: int, literal: str) -> None:
+    def __init__(
+        self, segment_idx: int, literal: str, offset: str | None = None
+    ) -> None:
         super().__init__()
         self._segment_idx = segment_idx
         self._literal = literal
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         template = "{0}if path[{1}] == '{2}':\n{3}"
         return template.format(
             _TAB_STR * indentation,
-            self._segment_idx,
+            _segment_idx_src(self._segment_idx, self._offset),
             self._literal,
             self._children_src(indentation + 1),
         )
 
 
 class _CxIfPathSegmentPattern(_CxParent):
-    def __init__(self, segment_idx: int, pattern_idx: int, pattern_text: str) -> None:
+    def __init__(
+        self,
+        segment_idx: int,
+        pattern_idx: int,
+        pattern_text: str,
+        offset: str | None = None,
+    ) -> None:
         super().__init__()
         self._segment_idx = segment_idx
         self._pattern_idx = pattern_idx
         self._pattern_text = pattern_text
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         lines = [
             '{0}match = patterns[{1}].match(path[{2}])  # {3}'.format(
                 _TAB_STR * indentation,
                 self._pattern_idx,
-                self._segment_idx,
+                _segment_idx_src(self._segment_idx, self._offset),
                 self._pattern_text,
             ),
             '{0}if match is not None:'.format(_TAB_STR * indentation),
@@ -1141,6 +1320,48 @@ class _CxIfConverterField(_CxParent):
         return '\n'.join(lines)
 
 
+class _CxForPathSplit(_CxParent):
+    """Loop over the feasible splits of the path for a multi-segment field.
+
+    The loop variable iterates over the candidate end indexes (exclusive) of
+    the span of segments consumed by the field, from the split that consumes
+    the most segments down to the one that consumes the fewest. Only splits
+    that leave room for the shortest, resp. the longest, remainder of the
+    template are considered, so the number of iterations is bounded by a
+    constant that only depends on the route templates, and not on the
+    requested path.
+    """
+
+    def __init__(
+        self,
+        loop_variable: str,
+        level: int,
+        min_suffix: int,
+        max_suffix: int,
+        offset: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._loop_variable = loop_variable
+        self._level = level
+        self._min_suffix = min_suffix
+        self._max_suffix = max_suffix
+        self._offset = offset
+
+    def src(self, indentation: int) -> str:
+        lines = [
+            '{0}for {1} in range(path_len - {2}, max({3}, path_len - {4}), -1):'.format(
+                _TAB_STR * indentation,
+                self._loop_variable,
+                self._min_suffix,
+                _segment_idx_src(self._level, self._offset),
+                self._max_suffix + 1,
+            ),
+            self._children_src(indentation + 1),
+        ]
+
+        return '\n'.join(lines)
+
+
 class _CxSetFragmentFromField(_CxChild):
     def __init__(self, field_name: str) -> None:
         self._field_name = field_name
@@ -1153,24 +1374,44 @@ class _CxSetFragmentFromField(_CxChild):
 
 
 class _CxSetFragmentFromPath(_CxChild):
-    def __init__(self, segment_idx: int) -> None:
+    def __init__(self, segment_idx: int, offset: str | None = None) -> None:
         self._segment_idx = segment_idx
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         return '{0}fragment = path[{1}]'.format(
             _TAB_STR * indentation,
-            self._segment_idx,
+            _segment_idx_src(self._segment_idx, self._offset),
         )
 
 
 class _CxSetFragmentFromRemainingPaths(_CxChild):
-    def __init__(self, segment_idx: int) -> None:
+    def __init__(self, segment_idx: int, offset: str | None = None) -> None:
         self._segment_idx = segment_idx
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         return '{0}fragment = path[{1}:]'.format(
             _TAB_STR * indentation,
-            self._segment_idx,
+            _segment_idx_src(self._segment_idx, self._offset),
+        )
+
+
+class _CxSetFragmentFromRange(_CxChild):
+    """Set the fragment to the segments before a runtime split point."""
+
+    def __init__(
+        self, segment_idx: int, end_variable: str, offset: str | None = None
+    ) -> None:
+        self._segment_idx = segment_idx
+        self._end_variable = end_variable
+        self._offset = offset
+
+    def src(self, indentation: int) -> str:
+        return '{0}fragment = path[{1}:{2}]'.format(
+            _TAB_STR * indentation,
+            _segment_idx_src(self._segment_idx, self._offset),
+            self._end_variable,
         )
 
 
@@ -1215,15 +1456,18 @@ class _CxReturnValue(_CxChild):
 
 
 class _CxSetParamFromPath(_CxChild):
-    def __init__(self, param_name: str, segment_idx: int) -> None:
+    def __init__(
+        self, param_name: str, segment_idx: int, offset: str | None = None
+    ) -> None:
         self._param_name = param_name
         self._segment_idx = segment_idx
+        self._offset = offset
 
     def src(self, indentation: int) -> str:
         return "{0}params['{1}'] = path[{2}]".format(
             _TAB_STR * indentation,
             self._param_name,
-            self._segment_idx,
+            _segment_idx_src(self._segment_idx, self._offset),
         )
 
 
