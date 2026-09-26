@@ -44,6 +44,7 @@ from falcon.response_helpers import _format_header_value_list
 from falcon.response_helpers import _format_range
 from falcon.response_helpers import _header_property
 from falcon.response_helpers import _is_ascii_encodable
+from falcon.response_helpers import _validate_sse_heartbeat_interval
 from falcon.typing import Headers
 from falcon.typing import ReadableIO
 from falcon.util import dt_to_http
@@ -1457,12 +1458,41 @@ class ResponseOptions:
     .. versionadded:: 4.0
     """
 
+    @property
+    def sse_heartbeat_interval(self) -> float | None:
+        """Interval, in seconds, between SSE heartbeat comment frames.
+
+        When set to a positive number of seconds, ASGI responses using
+        :attr:`resp.sse <falcon.asgi.Response.sse>` will automatically emit
+        a comment frame (``: ping``) whenever no event has been successfully
+        sent for the configured interval. This helps prevent proxies and
+        load balancers from closing idle SSE connections.
+
+        Heartbeats are disabled by default (``None``). This option only
+        takes effect for :class:`falcon.asgi.App` applications; it is
+        ignored by the WSGI flavor. The value can be overridden or disabled
+        for an individual response via
+        :attr:`falcon.asgi.Response.sse_heartbeat_interval`.
+
+        The value must be either ``None`` or a positive, finite number of
+        seconds; otherwise, a :class:`TypeError` or :class:`ValueError` is
+        raised, respectively.
+
+        .. versionadded:: 4.4
+        """
+        return self._sse_heartbeat_interval
+
+    @sse_heartbeat_interval.setter
+    def sse_heartbeat_interval(self, value: float | None) -> None:
+        self._sse_heartbeat_interval = _validate_sse_heartbeat_interval(value)
+
     __slots__ = (
         'secure_cookies_by_default',
         'default_media_type',
         'media_handlers',
         'static_media_types',
         'xml_error_serialization',
+        '_sse_heartbeat_interval',
     )
 
     def __init__(self) -> None:
@@ -1470,6 +1500,7 @@ class ResponseOptions:
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
         self.xml_error_serialization = True
+        self._sse_heartbeat_interval: float | None = None
 
         if not mimetypes.inited:
             mimetypes.init()

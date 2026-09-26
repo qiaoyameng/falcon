@@ -62,6 +62,7 @@ from falcon.errors import WebSocketDisconnected
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.media.multipart import MultipartFormHandler
+from falcon.typing import SSEEmitter
 from falcon.util.deprecation import DeprecatedWarning
 from falcon.util.misc import _has_arg_name
 from falcon.util.misc import is_python_func
@@ -92,6 +93,115 @@ _BODILESS_STATUS_CODES = frozenset([100, 101, 204, 304])
 _TYPELESS_STATUS_CODES = frozenset([204, 304])
 
 _FALLBACK_WS_ERROR_CODE = 3011
+
+_SSE_HEARTBEAT_FRAME: AsgiSendMsg = {
+    'type': EventType.HTTP_RESPONSE_BODY,
+    'body': b': ping\n\n',
+    'more_body': True,
+}
+
+# Indirection over asyncio.sleep() so that tests can substitute a
+#   controllable clock when exercising SSE heartbeats.
+_sse_sleep = asyncio.sleep
+
+
+async def _stream_sse_with_heartbeat(
+    emitter: SSEEmitter,
+    interval: float,
+    send: AsgiSend,
+    watcher: asyncio.Task[None],
+    sse_handler: Any,
+) -> None:
+    """Stream SSE events, emitting heartbeat comment frames when idle.
+
+    A heartbeat comment frame is sent whenever no event has been
+    successfully sent for ``interval`` seconds. At most one call to the
+    emitter's ``__anext__()`` is ever in flight, heartbeats neither cancel
+    nor restart the emitter, and no emitted events are dropped. Because
+    frames are sent inline in this loop, a blocked ``send`` simply stalls
+    the loop: heartbeat frames are never queued up, and no additional
+    events are prefetched from the emitter.
+
+    When this coroutine returns or raises for any reason (the emitter is
+    exhausted or raises, the client disconnects, or the request is
+    cancelled), the pending ``__anext__()`` call, if any, is cancelled and
+    the emitter is closed exactly once, while the original exception, if
+    any, is left to propagate.
+
+    Args:
+        emitter: The SSE emitter to stream events from.
+        interval: The maximum number of seconds that may elapse after a
+            successful send before a heartbeat comment frame is emitted.
+        send: The ASGI send callable.
+        watcher: A task that completes once the client has disconnected.
+        sse_handler: Media handler used to serialize events.
+    """
+    iterator = emitter.__aiter__()
+    anext_task: asyncio.Task[Any] = asyncio.ensure_future(iterator.__anext__())
+    timer: asyncio.Task[Any] | None = None
+
+    try:
+        while True:
+            timer = asyncio.ensure_future(_sse_sleep(interval))
+            done, _ = await asyncio.wait(
+                (anext_task, timer, watcher), return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if not timer.done():
+                timer.cancel()
+
+            if anext_task in done:
+                try:
+                    event = anext_task.result()
+                except StopAsyncIteration:
+                    break
+
+                if not event:
+                    event = SSEvent()
+
+                # According to the ASGI spec, once the client disconnects,
+                #   send() acts as a no-op. The connection state is tracked
+                #   via the watcher task instead.
+                await send(
+                    {
+                        'type': EventType.HTTP_RESPONSE_BODY,
+                        'body': event.serialize(sse_handler),
+                        'more_body': True,
+                    }
+                )
+
+                if watcher.done():
+                    break
+
+                anext_task = asyncio.ensure_future(iterator.__anext__())
+            elif watcher in done:
+                break
+            else:
+                # The heartbeat timer fired first. The pending
+                #   __anext__() is deliberately left running so that the
+                #   emitter is neither cancelled nor restarted.
+                await send(_SSE_HEARTBEAT_FRAME)
+    finally:
+        if timer is not None and not timer.done():
+            timer.cancel()
+            try:
+                await timer
+            except asyncio.CancelledError:
+                pass
+
+        if not anext_task.done():
+            anext_task.cancel()
+            try:
+                await anext_task
+            except asyncio.CancelledError:
+                pass
+
+        # Async generators (and some custom emitters) hold resources that
+        #   must be released; closing an already-exhausted or already-closed
+        #   emitter is a no-op, so this cleanup happens exactly once.
+        aclose = getattr(emitter, 'aclose', None)
+        if aclose is not None:
+            await aclose()
 
 
 class App(falcon.app.App[_ReqT, _RespT]):
@@ -790,34 +900,45 @@ class App(falcon.app.App[_ReqT, _RespT]):
                 MEDIA_JSON, MEDIA_JSON, raise_not_found=False
             )
 
-            # TODO(kgriffs): Do we need to do anything special to handle when
-            #   a connection is closed?
-            async for event in sse_emitter:
-                if not event:
-                    event = SSEvent()
+            heartbeat_interval = resp._sse_heartbeat_interval
+            if heartbeat_interval is _UNSET:
+                heartbeat_interval = self.resp_options.sse_heartbeat_interval
 
-                # NOTE(kgriffs): According to the ASGI spec, once the client
-                #   disconnects, send() acts as a no-op. We have to check
-                #   the connection state using watch_disconnect() above.
-                await send(
-                    {
-                        'type': EventType.HTTP_RESPONSE_BODY,
-                        'body': event.serialize(sse_handler),
-                        'more_body': True,
-                    }
-                )
-
-                if watcher.done():  # pragma: no py39,py310 cover
-                    break
-
-            # TODO(vytas): Remove these py314 pragmas here and in reader.py if
-            #   https://github.com/nedbat/coveragepy/issues/1999 gets resolved
-            #   before CPython 3.14.0 stable is out.
-            watcher.cancel()  # pragma: no py314 cover
             try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+                if heartbeat_interval is None:
+                    # TODO(kgriffs): Do we need to do anything special to handle
+                    #   when a connection is closed?
+                    async for event in sse_emitter:
+                        if not event:
+                            event = SSEvent()
+
+                        # NOTE(kgriffs): According to the ASGI spec, once the
+                        #   client disconnects, send() acts as a no-op. We have
+                        #   to check the connection state using
+                        #   watch_disconnect() above.
+                        await send(
+                            {
+                                'type': EventType.HTTP_RESPONSE_BODY,
+                                'body': event.serialize(sse_handler),
+                                'more_body': True,
+                            }
+                        )
+
+                        if watcher.done():  # pragma: no py39,py310 cover
+                            break
+                else:
+                    await _stream_sse_with_heartbeat(
+                        sse_emitter, heartbeat_interval, send, watcher, sse_handler
+                    )
+            finally:
+                # TODO(vytas): Remove these py314 pragmas here and in reader.py
+                #   if https://github.com/nedbat/coveragepy/issues/1999 gets
+                #   resolved before CPython 3.14.0 stable is out.
+                watcher.cancel()  # pragma: no py314 cover
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
 
             await send({'type': EventType.HTTP_RESPONSE_BODY})
             return

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import math
 from typing import Any, Callable, TYPE_CHECKING
 
 from falcon._typing import RangeSetHeader
@@ -132,6 +133,42 @@ def _format_etag_header(value: str) -> str:
 def _format_header_value_list(iterable: Iterable[str]) -> str:
     """Join an iterable of strings with commas."""
     return ', '.join(iterable)
+
+
+def _validate_sse_heartbeat_interval(value: float | None) -> float | None:
+    """Validate an SSE heartbeat interval.
+
+    Args:
+        value: The value to validate. ``None`` signifies that SSE heartbeats
+            are disabled; otherwise the value must be a positive, finite
+            number of seconds.
+
+    Returns:
+        float | None: The validated interval in seconds, or ``None`` when
+        heartbeats are disabled.
+
+    Raises:
+        TypeError: The value is neither ``None`` nor a real number.
+        ValueError: The value is not a positive, finite number.
+    """
+    if value is None:
+        return None
+
+    # bool is a subclass of int, but True/False is not a
+    #   meaningful interval, so we reject it explicitly.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            'The SSE heartbeat interval must be a number of seconds; '
+            'got %s instead.' % type(value).__name__
+        )
+
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            'The SSE heartbeat interval must be a positive, finite number '
+            'of seconds; got %r.' % (value,)
+        )
+
+    return float(value)
 
 
 def _is_ascii_encodable(s: str) -> bool:

@@ -28,6 +28,8 @@ from typing import (
 from falcon import response
 from falcon._typing import _UNSET
 from falcon._typing import ResponseCallbacks
+from falcon._typing import UnsetOr
+from falcon.response_helpers import _validate_sse_heartbeat_interval
 from falcon.typing import AsyncReadableIO
 from falcon.typing import SSEEmitter
 from falcon.util.misc import _encode_items_to_latin1
@@ -50,6 +52,7 @@ class Response(response.Response):
     #   us avoid having to implement __init__ and incur the overhead of
     #   an additional function call.
     _sse: SSEEmitter | None = None
+    _sse_heartbeat_interval: UnsetOr[float | None] = _UNSET
     _registered_callbacks: list[ResponseCallbacks] | None = None
 
     stream: AsyncReadableIO | AsyncIterator[bytes] | None  # type: ignore[assignment]
@@ -135,12 +138,63 @@ class Response(response.Response):
             When hosting an app that emits Server-Sent Events, the web
             server should be set with a relatively long keep-alive TTL to
             minimize the overhead of connection renegotiations.
+
+        Note:
+            Idle SSE connections are often closed by proxies and load
+            balancers. See :attr:`~falcon.asgi.Response.sse_heartbeat_interval`
+            for automatically emitting heartbeat comment frames when no
+            events are being sent.
         """  # noqa: D400 D205
         return self._sse
 
     @sse.setter
     def sse(self, value: SSEEmitter | None) -> None:
         self._sse = value
+
+    @property
+    def sse_heartbeat_interval(self) -> float | None:
+        """Interval, in seconds, between SSE heartbeat comment frames.
+
+        When set to a positive number of seconds, and the response's
+        :attr:`~falcon.asgi.Response.sse` emitter is in use, a comment frame
+        (``: ping``) is automatically sent to the client whenever no event
+        has been successfully sent for the configured interval. This helps
+        prevent proxies and load balancers from closing idle SSE
+        connections.
+
+        Heartbeats are only emitted while waiting for the next event from
+        the emitter; the emitter itself is neither cancelled nor restarted
+        by heartbeat frames, and no events are dropped. When the client is
+        slow to consume the response, heartbeats are not queued up, and no
+        additional events are prefetched from the emitter.
+
+        By default, the interval is inherited from
+        :attr:`falcon.ResponseOptions.sse_heartbeat_interval` (which itself
+        defaults to ``None``, i.e. heartbeats are disabled), and reading
+        this attribute returns the inherited value. Set this attribute to a
+        positive number of seconds to override the app-level default for
+        this response, or to ``None`` to disable heartbeats for this
+        response. Delete the attribute to restore inheritance of the
+        app-level default.
+
+        The value must be either ``None`` or a positive, finite number of
+        seconds; otherwise, a :class:`TypeError` or :class:`ValueError` is
+        raised, respectively.
+
+        .. versionadded:: 4.4
+        """
+        value = self._sse_heartbeat_interval
+        if value is _UNSET:
+            value = self.options.sse_heartbeat_interval
+        return value
+
+    @sse_heartbeat_interval.setter
+    def sse_heartbeat_interval(self, value: float | None) -> None:
+        self._sse_heartbeat_interval = _validate_sse_heartbeat_interval(value)
+
+    @sse_heartbeat_interval.deleter
+    def sse_heartbeat_interval(self) -> None:
+        self._sse_heartbeat_interval = _UNSET
 
     def set_stream(
         self,

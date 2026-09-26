@@ -4,6 +4,7 @@ import unittest.mock
 import pytest
 
 import falcon
+import falcon.asgi
 import falcon.testing
 
 
@@ -317,3 +318,44 @@ class TestMsgspec:
         resp7 = client.simulate_get('/notes')
         assert resp7.status_code == 200
         assert resp7.json == {}
+
+
+class TestSSEHeartbeat:
+    @staticmethod
+    async def _collect(app, path, stop):
+        collected = b''
+        async with falcon.testing.ASGIConductor(app) as conductor:
+            async with conductor.simulate_get_stream(path) as result:
+                while stop not in collected:
+                    chunk = await result.stream.read()
+                    if not chunk:
+                        continue
+                    collected += chunk
+        return collected
+
+    def test_heartbeats_emitted_when_idle(self, util):
+        recipe = util.load_module('examples/recipes/sse_heartbeat_app.py')
+        app = recipe.create_app(heartbeat_interval=0.05)
+
+        collected = falcon.async_to_sync(self._collect, app, '/clock', b': ping')
+
+        assert collected.startswith(b'data: tick:')
+        assert b': ping' in collected
+
+    def test_response_heartbeat_interval_override(self, util):
+        recipe = util.load_module('examples/recipes/sse_heartbeat_app.py')
+
+        app = falcon.asgi.App()
+
+        # The app-level default is far too slow to fire during this test;
+        #   only the per-response override can produce heartbeats.
+        app.resp_options.sse_heartbeat_interval = 3600
+        app.add_route(
+            '/slow',
+            recipe.SlowResource(event_interval=3600, heartbeat_interval=0.05),
+        )
+
+        collected = falcon.async_to_sync(self._collect, app, '/slow', b': ping')
+
+        assert b': ping' in collected
+        assert b'data:' not in collected
