@@ -322,6 +322,11 @@ class Request:
         self.stream = env['wsgi.input']
         self._bounded_stream: BoundedStream | None = None  # Lazy wrapping
 
+        if self.options.max_request_body_size is not None:
+            # Route all read entry points through the bounded stream so
+            #   that they share a single cumulative byte quota.
+            self.stream = self.bounded_stream
+
         # PERF(kgriffs): Technically, we should spend a few more
         # cycles and parse the content type for real, but
         # this heuristic will work virtually all the time.
@@ -2722,7 +2727,11 @@ class Request:
             # but it had an invalid value. Assume no content.
             content_length = 0
 
-        return BoundedStream(self.env['wsgi.input'], content_length)
+        return BoundedStream(
+            self.env['wsgi.input'],
+            content_length,
+            max_bytes=self.options.max_request_body_size,
+        )
 
     def _parse_form_urlencoded(self) -> None:
         content_length = self.content_length
@@ -2869,6 +2878,52 @@ class RequestOptions:
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
 
+    @property
+    def max_request_body_size(self) -> int | None:
+        """Maximum allowed request body size in bytes (default ``None``).
+
+        When set to an ``int``, Falcon enforces a cumulative limit on the
+        number of request body bytes that may be consumed by the app,
+        regardless of whether the body is read via the raw request stream,
+        :meth:`~falcon.Request.get_media`, or the multipart form parser.
+        When ``None`` (the default), no limit is enforced.
+
+        When the request's Content-Length is known up front to exceed this
+        limit, the request is rejected with a
+        :class:`~falcon.HTTPContentTooLarge` (413) error before any
+        responder or resource middleware is executed. Otherwise, the limit
+        is enforced while the body is being consumed, based on the actual
+        number of bytes read; as soon as the (limit + 1)th byte is
+        consumed, :class:`~falcon.HTTPContentTooLarge` is raised. Reading
+        exactly the maximum number of bytes is allowed.
+
+        Note:
+            For WSGI apps, enabling this option also causes
+            :attr:`~falcon.Request.stream` to be wrapped by
+            :attr:`~falcon.Request.bounded_stream`, so that all read
+            entry points share the same quota.
+
+        Note:
+            This limit is independent of, and applied in addition to, the
+            multipart parser's own limits (see
+            :class:`~falcon.media.multipart.MultipartParseOptions`).
+
+        The value must be ``None`` or a non-negative ``int``; any other
+        value raises ``ValueError`` when the option is set.
+        """
+        return self._max_request_body_size
+
+    @max_request_body_size.setter
+    def max_request_body_size(self, value: int | None) -> None:
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(
+                'max_request_body_size must be None or a non-negative int.'
+            )
+
+        self._max_request_body_size = value
+
     __slots__ = (
         'keep_blank_qs_values',
         '_auto_parse_form_urlencoded',
@@ -2876,6 +2931,7 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        '_max_request_body_size',
     )
 
     def __init__(self) -> None:
@@ -2885,3 +2941,4 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self._max_request_body_size: int | None = None

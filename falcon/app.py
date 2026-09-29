@@ -62,6 +62,7 @@ from falcon.http_status import HTTPStatus
 from falcon.middleware import CORSMiddleware
 from falcon.request import Request
 from falcon.request import RequestOptions
+from falcon.request_helpers import _request_body_too_large
 from falcon.response import Response
 from falcon.response import ResponseOptions
 import falcon.status_codes as status
@@ -436,6 +437,12 @@ class App(Generic[_ReqT, _RespT]):
         try:
             if req.method in self._META_METHODS:
                 raise HTTPBadRequest()
+
+            max_body_size = self.req_options.max_request_body_size
+            if max_body_size is not None:
+                content_length = req.content_length
+                if content_length is not None and content_length > max_body_size:
+                    raise _request_body_too_large(max_body_size)
 
             # NOTE(ealogar): The execution of request middleware
             # should be before routing. This will allow request mw

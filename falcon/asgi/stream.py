@@ -22,6 +22,7 @@ from typing import NoReturn
 from falcon._typing import AsgiReceive
 from falcon.asgi_spec import AsgiEvent
 from falcon.errors import OperationNotAllowed
+from falcon.request_helpers import _request_body_too_large
 
 __all__ = ('BoundedStream',)
 
@@ -99,6 +100,14 @@ class BoundedStream:
             if one was preloaded (default ``None``).
         content_length (int): Expected content length of the stream, derived
             from the Content-Length header in the request (if available).
+        max_bytes (int): Maximum number of bytes that may be consumed from
+            the stream, or ``None`` for no limit (default ``None``). When
+            the cumulative number of bytes consumed would exceed this
+            limit, :class:`~falcon.HTTPContentTooLarge` is raised as soon
+            as the first byte past the limit is received, rather than
+            buffering the entire body first. Once the limit has been
+            exceeded, all subsequent reads raise the same error, and
+            :meth:`~.exhaust` stops consuming without raising.
     """
 
     __slots__ = (
@@ -106,6 +115,8 @@ class BoundedStream:
         '_bytes_remaining',
         '_closed',
         '_iteration_started',
+        '_limit_exceeded',
+        '_max_bytes',
         '_pos',
         '_receive',
     )
@@ -114,6 +125,8 @@ class BoundedStream:
     _bytes_remaining: int
     _closed: bool
     _iteration_started: bool
+    _limit_exceeded: bool
+    _max_bytes: int | None
     _pos: int
     _receive: AsgiReceive
 
@@ -122,11 +135,14 @@ class BoundedStream:
         receive: AsgiReceive,
         first_event: AsgiEvent | None = None,
         content_length: int | None = None,
+        max_bytes: int | None = None,
     ) -> None:
         self._closed = False
         self._iteration_started = False
+        self._limit_exceeded = False
 
         self._receive = receive
+        self._max_bytes = max_bytes
 
         # NOTE(kgriffs): Outside of testing, first_event will always be set
         #   and we also assume a body is expected, otherwise why bother
@@ -156,7 +172,10 @@ class BoundedStream:
 
             self._bytes_remaining = content_length - len(self._buffer)
 
-        self._pos = len(self._buffer)
+        # Buffered bytes have been received, but not yet consumed by the
+        #   caller, so they are not counted here; they are accounted for
+        #   as they are read, yielded, or exhausted.
+        self._pos = 0
 
         if first_event and self._bytes_remaining:
             # NOTE(kgriffs): Override if the event says there's no more data
@@ -238,9 +257,20 @@ class BoundedStream:
                 'This stream is closed; no further operations on it are permitted.'
             )
 
+        if self._limit_exceeded:
+            # The body is already known to exceed the configured size
+            #   limit; do not consume any more of it.
+            return
+
+        self._pos += len(self._buffer)
         self._buffer = b''
 
         while self._bytes_remaining > 0:
+            if self._max_bytes is not None and self._pos >= self._max_bytes:
+                # The configured body size limit has been reached; stop
+                #   draining silently and leave the rest to the server.
+                return
+
             event = await self._receive()
 
             if event['type'] == 'http.disconnect':
@@ -265,6 +295,25 @@ class BoundedStream:
         #   value is normalized to zero.
         self._bytes_remaining = 0
 
+    def _check_body_size_limit(self, num_bytes: int = 0) -> None:
+        """Raise if consuming ``num_bytes`` more would exceed the limit.
+
+        Once the limit has been exceeded, all subsequent calls raise the
+        same error, even when no additional bytes are being consumed.
+
+        Args:
+            num_bytes (int): Number of additional bytes that are about to
+                be consumed from the stream.
+        """
+        max_bytes = self._max_bytes
+
+        if max_bytes is None:
+            return
+
+        if self._limit_exceeded or self._pos + num_bytes > max_bytes:
+            self._limit_exceeded = True
+            raise _request_body_too_large(max_bytes)
+
     async def readall(self) -> bytes:
         """Read and return all remaining data in the request body.
 
@@ -284,6 +333,8 @@ class BoundedStream:
                 'This stream is closed; no further operations on it are permitted.'
             )
 
+        self._check_body_size_limit()
+
         if self.eof:
             return b''
 
@@ -291,8 +342,12 @@ class BoundedStream:
             next_chunk = self._buffer
             self._buffer = b''
             chunks = [next_chunk]
+            num_bytes_collected = len(next_chunk)
         else:
             chunks = []
+            num_bytes_collected = 0
+
+        self._check_body_size_limit(num_bytes_collected)
 
         while self._bytes_remaining > 0:
             event = await self._receive()
@@ -309,13 +364,17 @@ class BoundedStream:
                 if next_chunk_len <= self._bytes_remaining:
                     chunks.append(next_chunk)
                     self._bytes_remaining -= next_chunk_len
+                    num_bytes_collected += next_chunk_len
                 else:
                     # NOTE(kgriffs): Do not read more data than we are
                     #   expecting. This *should* never happen if the
                     #   server enforces the content-length header, but
                     #   it is better to be safe than sorry.
                     chunks.append(next_chunk[: self._bytes_remaining])
+                    num_bytes_collected += self._bytes_remaining
                     self._bytes_remaining = 0
+
+            self._check_body_size_limit(num_bytes_collected)
 
             # NOTE(kgriffs): This also handles the case of receiving
             #   the event: {'type': 'http.disconnect'}
@@ -362,6 +421,8 @@ class BoundedStream:
                 'This stream is closed; no further operations on it are permitted.'
             )
 
+        self._check_body_size_limit()
+
         if self.eof:
             return b''
 
@@ -402,6 +463,8 @@ class BoundedStream:
                     self._bytes_remaining = 0
                     num_bytes_available += self._bytes_remaining
 
+            self._check_body_size_limit(num_bytes_available)
+
             # NOTE(kgriffs): This also handles the case of receiving
             #   the event: {'type': 'http.disconnect'}
             if not ('more_body' in event and event['more_body']):
@@ -415,6 +478,8 @@ class BoundedStream:
         else:
             data = self._buffer[:size]
             self._buffer = self._buffer[size:]
+
+        self._check_body_size_limit(len(data))
 
         self._pos += len(data)
 
@@ -432,11 +497,15 @@ class BoundedStream:
         if self._iteration_started:
             raise OperationNotAllowed('This stream is already being iterated over.')
 
+        self._check_body_size_limit()
+
         self._iteration_started = True
 
         if self._buffer:
             next_chunk = self._buffer
             self._buffer = b''
+
+            self._check_body_size_limit(len(next_chunk))
 
             self._pos += len(next_chunk)
             yield next_chunk
@@ -457,14 +526,16 @@ class BoundedStream:
 
                     if next_chunk_len <= self._bytes_remaining:
                         self._bytes_remaining -= next_chunk_len
-                        self._pos += next_chunk_len
                     else:
                         # NOTE(kgriffs): We received more data than expected,
                         #   so truncate to the expected length.
                         next_chunk = next_chunk[: self._bytes_remaining]
-                        self._pos += self._bytes_remaining
+                        next_chunk_len = self._bytes_remaining
                         self._bytes_remaining = 0
 
+                    self._check_body_size_limit(next_chunk_len)
+
+                    self._pos += next_chunk_len
                     yield next_chunk
 
             # NOTE(kgriffs): Per the ASGI spec, more_body is optional

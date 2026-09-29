@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 from typing import BinaryIO, Callable, TypeVar, Union
 
+from falcon.request_helpers import _request_body_too_large
 from falcon.util import deprecated
 
 __all__ = ('BoundedStream',)
@@ -45,19 +46,36 @@ class BoundedStream(io.IOBase):
         stream: Instance of ``socket._fileobject`` from
             ``environ['wsgi.input']``
         stream_len: Expected content length of the stream.
+        max_bytes: Maximum number of bytes that may be consumed from the
+            stream, or ``None`` for no limit (default ``None``). When the
+            cumulative number of bytes read would exceed this limit,
+            :class:`~falcon.HTTPContentTooLarge` is raised instead of
+            reading past the limit.
     """
 
-    def __init__(self, stream: BinaryIO, stream_len: int) -> None:
+    def __init__(
+        self, stream: BinaryIO, stream_len: int, max_bytes: int | None = None
+    ) -> None:
         self.stream = stream
         self.stream_len = stream_len
 
         self._bytes_remaining = self.stream_len
+        self._max_bytes = max_bytes
+        self._bytes_consumed = 0
 
     def __iter__(self) -> BoundedStream:
         return self
 
     def __next__(self) -> bytes:
-        return next(self.stream)
+        chunk = next(self.stream)
+
+        if self._max_bytes is not None:
+            self._bytes_consumed += len(chunk)
+
+            if self._bytes_consumed > self._max_bytes:
+                raise _request_body_too_large(self._max_bytes)
+
+        return chunk
 
     next = __next__
 
@@ -83,6 +101,12 @@ class BoundedStream(io.IOBase):
         # similarly to the IO streams passed in by non-wsgiref servers.
         if size is None or size == -1 or size > self._bytes_remaining:
             size = self._bytes_remaining
+
+        if self._max_bytes is not None:
+            if size and self._bytes_consumed + size > self._max_bytes:
+                raise _request_body_too_large(self._max_bytes)
+
+            self._bytes_consumed += size
 
         self._bytes_remaining -= size
         return target(size)
@@ -155,8 +179,21 @@ class BoundedStream(io.IOBase):
             chunk_size (int): The size for a chunk (default: 64 KB).
                 It will read the chunk until the stream is exhausted.
         """
+        max_bytes = self._max_bytes
+
         while True:
-            chunk = self.read(chunk_size)
+            if max_bytes is None:
+                chunk = self.read(chunk_size)
+            else:
+                allowance = max_bytes - self._bytes_consumed
+
+                if allowance <= 0:
+                    # The configured body size limit has been reached; stop
+                    #   draining silently and leave the rest to the server.
+                    return
+
+                chunk = self.read(min(chunk_size, allowance))
+
             if not chunk:
                 break
 

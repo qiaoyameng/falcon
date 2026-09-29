@@ -62,6 +62,7 @@ from falcon.errors import WebSocketDisconnected
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.media.multipart import MultipartFormHandler
+from falcon.request_helpers import _request_body_too_large
 from falcon.util.deprecation import DeprecatedWarning
 from falcon.util.misc import _has_arg_name
 from falcon.util.misc import is_python_func
@@ -529,6 +530,12 @@ class App(falcon.app.App[_ReqT, _RespT]):
         try:
             if req.method in self._META_METHODS:
                 raise HTTPBadRequest()
+
+            max_body_size = self.req_options.max_request_body_size
+            if max_body_size is not None:
+                content_length = req.content_length
+                if content_length is not None and content_length > max_body_size:
+                    raise _request_body_too_large(max_body_size)
 
             # NOTE(ealogar): The execution of request middleware
             # should be before routing. This will allow request mw

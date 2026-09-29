@@ -20,6 +20,7 @@ from http import cookies as http_cookies
 import re
 from typing import Any, Literal, TYPE_CHECKING
 
+from falcon.errors import HTTPContentTooLarge
 from falcon.util import ETag
 
 if TYPE_CHECKING:
@@ -175,3 +176,20 @@ def _parse_etags(etag_str: str) -> list[ETag | Literal['*']] | None:
     #   are all set to nothing, and so therefore basically should be
     #   treated as not having been set in the first place.
     return etags or None
+
+
+def _request_body_too_large(max_bytes: int) -> HTTPContentTooLarge:
+    """Create a 413 error for a request body that exceeded the size limit.
+
+    Args:
+        max_bytes (int): The configured maximum request body size, in bytes.
+
+    Returns:
+        HTTPContentTooLarge: An error instance ready to be raised.
+    """
+    return HTTPContentTooLarge(
+        description=(
+            'The size of the request body exceeds the configured '
+            'limit of {} bytes.'.format(max_bytes)
+        )
+    )
