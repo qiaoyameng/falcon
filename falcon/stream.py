@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 from typing import BinaryIO, Callable, TypeVar, Union
 
+from falcon.request_helpers import _body_too_large
 from falcon.util import deprecated
 
 __all__ = ('BoundedStream',)
@@ -45,19 +46,38 @@ class BoundedStream(io.IOBase):
         stream: Instance of ``socket._fileobject`` from
             ``environ['wsgi.input']``
         stream_len: Expected content length of the stream.
+        max_bytes: Optional maximum number of bytes that may be consumed
+            from the stream. When the limit is exceeded,
+            :class:`~falcon.HTTPContentTooLarge` is raised, and the stream
+            stops consuming data from the wrapped stream
+            (default ``None``, i.e. no limit).
     """
 
-    def __init__(self, stream: BinaryIO, stream_len: int) -> None:
+    def __init__(
+        self, stream: BinaryIO, stream_len: int, max_bytes: int | None = None
+    ) -> None:
         self.stream = stream
         self.stream_len = stream_len
+        self.max_bytes = max_bytes
 
         self._bytes_remaining = self.stream_len
+        self._bytes_read = 0
 
     def __iter__(self) -> BoundedStream:
         return self
 
     def __next__(self) -> bytes:
-        return next(self.stream)
+        line = next(self.stream)
+
+        if self.max_bytes is not None:
+            self._bytes_read += len(line)
+            if self._bytes_read > self.max_bytes:
+                # NOTE: Stop consuming the stream so that no more data is
+                #   pulled from the wrapped stream.
+                self._bytes_remaining = 0
+                raise _body_too_large(self.max_bytes)
+
+        return line
 
     next = __next__
 
@@ -84,7 +104,15 @@ class BoundedStream(io.IOBase):
         if size is None or size == -1 or size > self._bytes_remaining:
             size = self._bytes_remaining
 
+        max_bytes = self.max_bytes
+        if max_bytes is not None and self._bytes_read + size > max_bytes:
+            # NOTE: Stop consuming the stream so that no more data is
+            #   pulled from the wrapped stream.
+            self._bytes_remaining = 0
+            raise _body_too_large(max_bytes)
+
         self._bytes_remaining -= size
+        self._bytes_read += size
         return target(size)
 
     def readable(self) -> bool:

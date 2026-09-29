@@ -20,10 +20,30 @@ from http import cookies as http_cookies
 import re
 from typing import Any, Literal, TYPE_CHECKING
 
+from falcon.errors import HTTPContentTooLarge
 from falcon.util import ETag
 
 if TYPE_CHECKING:
     from falcon.request import Request
+
+
+def _body_too_large(max_bytes: int) -> HTTPContentTooLarge:
+    """Create a 413 error for an exceeded request body byte limit.
+
+    Args:
+        max_bytes (int): The configured request body byte limit that
+            was exceeded.
+
+    Returns:
+        HTTPContentTooLarge: An error instance ready to be raised.
+    """
+    return HTTPContentTooLarge(
+        description='The request body exceeds the configured limit of '
+        + str(max_bytes)
+        + ' bytes.'
+    )
+
+
 # https://tools.ietf.org/html/rfc6265#section-4.1.1
 #
 # NOTE(kgriffs): Fortunately we don't have to worry about code points in

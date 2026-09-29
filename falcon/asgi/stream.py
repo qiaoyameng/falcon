@@ -22,6 +22,7 @@ from typing import NoReturn
 from falcon._typing import AsgiReceive
 from falcon.asgi_spec import AsgiEvent
 from falcon.errors import OperationNotAllowed
+from falcon.request_helpers import _body_too_large
 
 __all__ = ('BoundedStream',)
 
@@ -99,21 +100,30 @@ class BoundedStream:
             if one was preloaded (default ``None``).
         content_length (int): Expected content length of the stream, derived
             from the Content-Length header in the request (if available).
+        max_bytes (int): Optional maximum number of bytes that may be
+            consumed from the stream. When the limit is exceeded,
+            :class:`~falcon.HTTPContentTooLarge` is raised, and the stream
+            stops consuming data from the ASGI receive channel
+            (default ``None``, i.e. no limit).
     """
 
     __slots__ = (
         '_buffer',
+        '_bytes_received',
         '_bytes_remaining',
         '_closed',
         '_iteration_started',
+        '_max_bytes',
         '_pos',
         '_receive',
     )
 
     _buffer: bytes
+    _bytes_received: int
     _bytes_remaining: int
     _closed: bool
     _iteration_started: bool
+    _max_bytes: int | None
     _pos: int
     _receive: AsgiReceive
 
@@ -122,11 +132,13 @@ class BoundedStream:
         receive: AsgiReceive,
         first_event: AsgiEvent | None = None,
         content_length: int | None = None,
+        max_bytes: int | None = None,
     ) -> None:
         self._closed = False
         self._iteration_started = False
 
         self._receive = receive
+        self._max_bytes = max_bytes
 
         # NOTE(kgriffs): Outside of testing, first_event will always be set
         #   and we also assume a body is expected, otherwise why bother
@@ -162,6 +174,14 @@ class BoundedStream:
             # NOTE(kgriffs): Override if the event says there's no more data
             if not ('more_body' in first_event and first_event['more_body']):
                 self._bytes_remaining = 0
+
+        # NOTE: Bytes already received via the first event count towards
+        #   the configured limit, if any.
+        self._bytes_received = len(self._buffer)
+        if max_bytes is not None and self._bytes_received > max_bytes:
+            self._buffer = b''
+            self._bytes_remaining = 0
+            raise _body_too_large(max_bytes)
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         # NOTE(kgriffs): This returns an async generator, but that's OK because
@@ -255,6 +275,9 @@ class BoundedStream:
                 self._bytes_remaining -= num_bytes
                 self._pos += num_bytes
 
+                if self._max_bytes is not None:
+                    self._track_received(num_bytes)
+
                 if not ('more_body' in event and event['more_body']):
                     self._bytes_remaining = 0
 
@@ -309,12 +332,19 @@ class BoundedStream:
                 if next_chunk_len <= self._bytes_remaining:
                     chunks.append(next_chunk)
                     self._bytes_remaining -= next_chunk_len
+
+                    if self._max_bytes is not None:
+                        self._track_received(next_chunk_len)
                 else:
                     # NOTE(kgriffs): Do not read more data than we are
                     #   expecting. This *should* never happen if the
                     #   server enforces the content-length header, but
                     #   it is better to be safe than sorry.
                     chunks.append(next_chunk[: self._bytes_remaining])
+
+                    if self._max_bytes is not None:
+                        self._track_received(self._bytes_remaining)
+
                     self._bytes_remaining = 0
 
             # NOTE(kgriffs): This also handles the case of receiving
@@ -394,11 +424,18 @@ class BoundedStream:
                     chunks.append(next_chunk)
                     self._bytes_remaining -= next_chunk_len
                     num_bytes_available += next_chunk_len
+
+                    if self._max_bytes is not None:
+                        self._track_received(next_chunk_len)
                 else:
                     # NOTE(kgriffs): Do not read more data than we are
                     #   expecting. This *should* never happen, but better
                     #   safe than sorry.
                     chunks.append(next_chunk[: self._bytes_remaining])
+
+                    if self._max_bytes is not None:
+                        self._track_received(self._bytes_remaining)
+
                     self._bytes_remaining = 0
                     num_bytes_available += self._bytes_remaining
 
@@ -458,11 +495,18 @@ class BoundedStream:
                     if next_chunk_len <= self._bytes_remaining:
                         self._bytes_remaining -= next_chunk_len
                         self._pos += next_chunk_len
+
+                        if self._max_bytes is not None:
+                            self._track_received(next_chunk_len)
                     else:
                         # NOTE(kgriffs): We received more data than expected,
                         #   so truncate to the expected length.
                         next_chunk = next_chunk[: self._bytes_remaining]
                         self._pos += self._bytes_remaining
+
+                        if self._max_bytes is not None:
+                            self._track_received(self._bytes_remaining)
+
                         self._bytes_remaining = 0
 
                     yield next_chunk
@@ -475,3 +519,24 @@ class BoundedStream:
             #   few more CPU cycles.
             if not ('more_body' in event and event['more_body']):
                 self._bytes_remaining = 0
+
+    def _track_received(self, num_bytes: int) -> None:
+        """Account for bytes consumed from the ASGI receive channel.
+
+        Once the configured byte limit is exceeded, the stream stops
+        consuming data from the receive channel and behaves as exhausted.
+
+        Args:
+            num_bytes (int): Number of bytes just consumed.
+
+        Raises:
+            HTTPContentTooLarge: The configured byte limit was exceeded.
+        """
+        self._bytes_received += num_bytes
+
+        if self._bytes_received > self._max_bytes:  # type: ignore[operator]
+            # NOTE: Stop consuming the stream so that no more events are
+            #   pulled from the receive channel.
+            self._buffer = b''
+            self._bytes_remaining = 0
+            raise _body_too_large(self._max_bytes)  # type: ignore[arg-type]

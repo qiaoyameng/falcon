@@ -348,7 +348,10 @@ class MultipartForm:
         #   streams easier within the same test/benchmark suite.
         if not hasattr(stream, 'read_until'):
             assert content_length is not None
-            if isinstance(stream, BoundedStream):
+            # NOTE: When a request body byte limit is configured, the
+            #   BoundedStream must not be unwrapped, so that its
+            #   enforcement of the limit is not bypassed.
+            if isinstance(stream, BoundedStream) and stream.max_bytes is None:
                 stream = BufferedReader(stream.stream.read, content_length)
             else:
                 stream = BufferedReader(stream.read, content_length)

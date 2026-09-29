@@ -2722,7 +2722,9 @@ class Request:
             # but it had an invalid value. Assume no content.
             content_length = 0
 
-        return BoundedStream(self.env['wsgi.input'], content_length)
+        return BoundedStream(
+            self.env['wsgi.input'], content_length, self.options.body_max_bytes
+        )
 
     def _parse_form_urlencoded(self) -> None:
         content_length = self.content_length
@@ -2869,10 +2871,62 @@ class RequestOptions:
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
 
+    @property
+    def body_max_bytes(self) -> int | None:
+        """Maximum number of bytes allowed in a request body (default ``None``).
+
+        When this option is set to a non-negative ``int``, both the WSGI and
+        ASGI flavors of the framework enforce a shared budget on the total
+        number of body bytes consumed by a single request, regardless of
+        whether the body is read via the request stream,
+        :meth:`~falcon.Request.get_media`, or the multipart form parser.
+        The default value of ``None`` disables the limit.
+
+        When the Content-Length of the request is known to exceed the
+        limit, the request is rejected with a
+        :class:`~falcon.HTTPContentTooLarge` error before the resource
+        responder is executed. Otherwise (for example, when the ASGI
+        server streams the body in chunks without declaring its length),
+        the actual number of bytes consumed is tallied as they are read,
+        and :class:`~falcon.HTTPContentTooLarge` is raised as soon as the
+        next byte would exceed the limit; a body that is exactly
+        ``body_max_bytes`` long is accepted. The stream then stops
+        consuming data, so the remaining body is never buffered in memory.
+
+        If the error is raised before the ASGI response has been started,
+        it is handled like any other :class:`~falcon.HTTPError` (including
+        any custom error handlers registered for it). If the response has
+        already been committed (for example, the limit is exceeded while
+        rendering a streaming response), the error instead propagates to
+        the ASGI server, aborting the response without emitting a second
+        response start event.
+
+        Note:
+            This limit is independent of, and applied in addition to, the
+            multipart parser's own limits (see
+            :class:`~falcon.media.multipart.MultipartParseOptions`).
+
+        .. versionadded:: 4.4
+        """  # noqa: D205
+        return self._body_max_bytes
+
+    @body_max_bytes.setter
+    def body_max_bytes(self, value: int | None) -> None:
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(
+                'body_max_bytes must be None or a non-negative int, '
+                'got: %r' % (value,)
+            )
+
+        self._body_max_bytes = value
+
     __slots__ = (
         'keep_blank_qs_values',
         '_auto_parse_form_urlencoded',
         'auto_parse_qs_csv',
+        '_body_max_bytes',
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
@@ -2882,6 +2936,7 @@ class RequestOptions:
         self.keep_blank_qs_values = True
         self._auto_parse_form_urlencoded = False
         self.auto_parse_qs_csv = False
+        self._body_max_bytes: int | None = None
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
